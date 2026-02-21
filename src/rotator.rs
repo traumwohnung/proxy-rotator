@@ -16,8 +16,6 @@ pub struct Rotator {
 struct RotatorSet {
     name: String,
     proxies: Vec<ProxyEntry>,
-    upstream_username: Option<String>,
-    upstream_password: Option<String>,
     affinity: Option<AffinityTable>,
 }
 
@@ -70,8 +68,6 @@ impl Rotator {
                 RotatorSet {
                     name: ps.name,
                     proxies,
-                    upstream_username: ps.upstream_username,
-                    upstream_password: ps.upstream_password,
                     affinity,
                 }
             })
@@ -81,6 +77,7 @@ impl Rotator {
 
     /// Find a proxy set by name and return the next proxy.
     /// Uses least-used selection with random tie-breaking.
+    /// Credentials come from the proxy entry itself.
     /// `client_ip` is used for session affinity if configured.
     pub fn next_proxy(&self, set_name: &str, client_ip: IpAddr) -> Option<ResolvedProxy> {
         let set = self.sets.iter().find(|s| s.name == set_name)?;
@@ -88,8 +85,8 @@ impl Rotator {
         Some(ResolvedProxy {
             host: proxy.host.clone(),
             port: proxy.port,
-            username: set.upstream_username.clone(),
-            password: set.upstream_password.clone(),
+            username: proxy.username.clone(),
+            password: proxy.password.clone(),
         })
     }
 
@@ -143,7 +140,6 @@ impl RotatorSet {
     /// Pick the proxy with the lowest use_count.
     /// When multiple proxies share the minimum count, pick one at random.
     fn pick_least_used(&self) -> usize {
-        // Find the minimum use count.
         let min_count = self
             .proxies
             .iter()
@@ -151,7 +147,6 @@ impl RotatorSet {
             .min()
             .unwrap_or(0);
 
-        // Collect all indices with that minimum count.
         let candidates: Vec<usize> = self
             .proxies
             .iter()
@@ -160,7 +155,6 @@ impl RotatorSet {
             .map(|(i, _)| i)
             .collect();
 
-        // Pick a random candidate using cheap entropy (no extra crate needed).
         let idx = if candidates.len() == 1 {
             candidates[0]
         } else {
@@ -178,7 +172,6 @@ fn cheap_random() -> u64 {
     use std::cell::Cell;
     thread_local! {
         static STATE: Cell<u64> = Cell::new(
-            // Seed from thread id + timestamp for uniqueness across threads.
             {
                 let t = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -193,7 +186,6 @@ fn cheap_random() -> u64 {
     }
     STATE.with(|s| {
         let mut x = s.get();
-        // xorshift64
         x ^= x << 13;
         x ^= x >> 7;
         x ^= x << 17;
@@ -238,14 +230,14 @@ mod tests {
             .map(|i| UpstreamProxy {
                 host: format!("proxy{i}.example.com"),
                 port: 8080,
+                username: Some("testuser".to_string()),
+                password: Some("testpass".to_string()),
             })
             .collect();
         ProxySet {
             name: "test".to_string(),
             proxies,
             session_affinity_secs: affinity_secs,
-            upstream_username: None,
-            upstream_password: None,
         }
     }
 
@@ -260,8 +252,6 @@ mod tests {
             *counts.entry(p.host.clone()).or_default() += 1;
         }
 
-        // With 4 proxies and 400 requests, each should get exactly 100
-        // (least-used always picks from the minimum bucket).
         assert_eq!(counts.len(), 4);
         for (host, count) in &counts {
             assert!(
@@ -272,20 +262,26 @@ mod tests {
     }
 
     #[test]
+    fn test_credentials_from_proxy_entry() {
+        let rotator = Rotator::new(vec![make_test_set(1, 0)]);
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let p = rotator.next_proxy("test", ip).unwrap();
+        assert_eq!(p.username.as_deref(), Some("testuser"));
+        assert_eq!(p.password.as_deref(), Some("testpass"));
+    }
+
+    #[test]
     fn test_session_affinity() {
         let rotator = Rotator::new(vec![make_test_set(4, 300)]);
 
         let ip1: IpAddr = "10.0.0.1".parse().unwrap();
         let ip2: IpAddr = "10.0.0.2".parse().unwrap();
 
-        // First request assigns a proxy.
         let p1a = rotator.next_proxy("test", ip1).unwrap();
         let p1b = rotator.next_proxy("test", ip1).unwrap();
         assert_eq!(p1a.host, p1b.host, "Same IP should get same proxy");
 
-        // Different IP may get a different proxy.
         let p2 = rotator.next_proxy("test", ip2).unwrap();
-        // (Could be same or different, but both should be valid.)
         assert!(p2.host.starts_with("proxy"));
     }
 
@@ -302,9 +298,12 @@ mod tests {
         for _ in 0..100 {
             vals.push(cheap_random());
         }
-        // Should have many distinct values.
         vals.sort();
         vals.dedup();
-        assert!(vals.len() > 50, "Expected varied random output, got {} unique values", vals.len());
+        assert!(
+            vals.len() > 50,
+            "Expected varied random output, got {} unique values",
+            vals.len()
+        );
     }
 }

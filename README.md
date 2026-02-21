@@ -9,9 +9,10 @@ Client ──HTTP/CONNECT──→ proxy-rotator ──→ upstream proxy pool �
 ```
 
 - **No TLS termination** — raw bytes are relayed through CONNECT tunnels. The client's own TLS handshake reaches the destination untouched.
-- Multiple **proxy sets** — each with its own pool of upstream proxies, rotation strategy, and optional credentials.
+- Multiple **proxy sets** — each with its own pool of upstream proxies and rotation strategy.
 - **Least-used rotation** — requests go to the proxy with the lowest use count, with random tie-breaking among equally-used proxies.
 - **Session affinity** — optionally pin a client IP to the same upstream proxy for a configurable duration.
+- **Per-proxy credentials** — each proxy entry includes its own username:password.
 
 ## Configuration
 
@@ -25,8 +26,6 @@ log_level = "info"
 name = "residential"
 proxies_file = "proxies/residential.txt"
 session_affinity_secs = 300         # same client IP → same proxy for 5 min
-upstream_username = "user123"       # optional: sent to upstream proxies
-upstream_password = "pass456"       # optional: sent to upstream proxies
 
 [[proxy_set]]
 name = "datacenter"
@@ -36,13 +35,13 @@ session_affinity_secs = 0           # pure least-used rotation
 
 ### Proxy list files
 
-One proxy per line, `host:port` format. Comments (`#`) and blank lines are ignored:
+One proxy per line. Format: `host:port:username:password` or `host:port` (no auth). Comments (`#`) and blank lines are ignored:
 
 ```
-# US datacenter proxies
-dc1.proxy.example.com:3128
-dc2.proxy.example.com:3128
-dc3.proxy.example.com:8080
+# Residential static proxies
+150.241.111.154:6658:dlipsdjpstaticresidential:epzji8na3wlr
+82.23.88.116:7872:dlipsdjpstaticresidential:epzji8na3wlr
+91.134.52.73:5432:dlipsdjpstaticresidential:epzji8na3wlr
 ```
 
 ## Usage
@@ -88,8 +87,9 @@ curl -x http://127.0.0.1:8100 https://httpbin.org/ip
 1. Client connects and sends an HTTP request or CONNECT tunnel request
 2. The proxy set is selected from `Proxy-Authorization: Basic base64(set_name:)`
 3. An upstream proxy is chosen using **least-used rotation** (lowest use count, random tie-breaking)
-4. For **CONNECT**: a tunnel is established through the upstream proxy, then raw bytes are relayed bidirectionally — no TLS breaking
-5. For **plain HTTP**: the request is forwarded through the upstream proxy with the absolute URI
+4. Credentials from the proxy entry (`host:port:user:pass`) are forwarded to the upstream proxy
+5. For **CONNECT**: a tunnel is established through the upstream proxy, then raw bytes are relayed bidirectionally — no TLS breaking
+6. For **plain HTTP**: the request is forwarded through the upstream proxy with the absolute URI
 
 ### Least-used rotation
 
@@ -113,6 +113,8 @@ docker run -p 8100:8100 \
   -v ./proxies:/data/config/proxies:ro \
   proxy-rotator
 ```
+
+See [`deployment/`](deployment/) for a complete docker-compose example with sample proxy files.
 
 Pre-built images: `ghcr.io/<owner>/proxy-rotator`
 

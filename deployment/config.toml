@@ -1,0 +1,18 @@
+# Proxy Rotator — Production Configuration
+#
+# Clients select a proxy set via:
+#   curl -x http://proxy-rotator:8100 --proxy-user "residential:" https://...
+#   curl -x http://proxy-rotator:8100 --proxy-user "datacenter:" https://...
+
+bind_addr = "0.0.0.0:8100"
+log_level = "info"
+
+[[proxy_set]]
+name = "residential"
+proxies_file = "/data/config/proxies/residential.txt"
+session_affinity_secs = 300
+
+[[proxy_set]]
+name = "datacenter"
+proxies_file = "/data/config/proxies/datacenter.txt"
+session_affinity_secs = 0

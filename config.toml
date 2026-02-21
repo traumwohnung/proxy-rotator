@@ -13,8 +13,6 @@ log_level = "info"
 name = "residential"
 proxies_file = "proxies/residential.txt"
 session_affinity_secs = 300       # same client IP → same proxy for 5 minutes
-# upstream_username = "user123"   # optional: sent to upstream proxies
-# upstream_password = "pass456"   # optional: sent to upstream proxies
 
 # Example proxy set: datacenter proxies
 [[proxy_set]]
