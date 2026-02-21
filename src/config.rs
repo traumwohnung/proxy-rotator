@@ -26,22 +26,15 @@ pub struct ProxySetConfig {
     /// Name of this proxy set (used as the proxy username to select it).
     pub name: String,
 
-    /// Path to the proxies.txt file (one proxy per line: host:port).
+    /// Path to the proxies file (one proxy per line).
+    /// Format: host:port:username:password  or  host:port
     pub proxies_file: PathBuf,
 
     /// Session affinity duration in seconds.
     /// When set, the same client IP will be routed to the same upstream proxy
-    /// for this duration. 0 = no affinity (pure round-robin).
+    /// for this duration. 0 = no affinity (pure least-used rotation).
     #[serde(default)]
     pub session_affinity_secs: u64,
-
-    /// Optional username to send to upstream proxies.
-    #[serde(default)]
-    pub upstream_username: Option<String>,
-
-    /// Optional password to send to upstream proxies.
-    #[serde(default)]
-    pub upstream_password: Option<String>,
 }
 
 fn default_bind_addr() -> String {
@@ -52,11 +45,13 @@ fn default_log_level() -> String {
     "info".to_string()
 }
 
-/// A parsed upstream proxy entry.
+/// A parsed upstream proxy entry with optional credentials.
 #[derive(Debug, Clone)]
 pub struct UpstreamProxy {
     pub host: String,
     pub port: u16,
+    pub username: Option<String>,
+    pub password: Option<String>,
 }
 
 /// A fully-loaded proxy set ready for use.
@@ -65,8 +60,6 @@ pub struct ProxySet {
     pub name: String,
     pub proxies: Vec<UpstreamProxy>,
     pub session_affinity_secs: u64,
-    pub upstream_username: Option<String>,
-    pub upstream_password: Option<String>,
 }
 
 impl Config {
@@ -80,7 +73,10 @@ impl Config {
     }
 }
 
-/// Parse a proxies.txt file. Each line is `host:port` (comments with # and blanks are skipped).
+/// Parse a proxies file. Each line is one of:
+///   host:port:username:password
+///   host:port
+/// Comments with # and blank lines are skipped.
 pub fn load_proxies(path: &Path) -> Result<Vec<UpstreamProxy>> {
     let content =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
@@ -90,7 +86,7 @@ pub fn load_proxies(path: &Path) -> Result<Vec<UpstreamProxy>> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let (host, port) = parse_host_port(line).with_context(|| {
+        let proxy = parse_proxy_line(line).with_context(|| {
             format!(
                 "{}:{}: invalid proxy entry '{}'",
                 path.display(),
@@ -98,26 +94,78 @@ pub fn load_proxies(path: &Path) -> Result<Vec<UpstreamProxy>> {
                 line
             )
         })?;
-        proxies.push(UpstreamProxy { host, port });
+        proxies.push(proxy);
     }
     Ok(proxies)
 }
 
-fn parse_host_port(s: &str) -> Result<(String, u16)> {
-    // Handle IPv6 [host]:port
-    if let Some(bracket_end) = s.find(']') {
-        let host = &s[1..bracket_end];
-        let port_str = s.get(bracket_end + 2..).unwrap_or("80");
-        let port: u16 = port_str.parse().context("invalid port")?;
-        return Ok((host.to_string(), port));
+/// Parse a single proxy line.
+/// Supports:
+///   host:port:username:password
+///   host:port
+///   [ipv6]:port:username:password
+///   [ipv6]:port
+fn parse_proxy_line(s: &str) -> Result<UpstreamProxy> {
+    // Handle IPv6 [host]:port...
+    if s.starts_with('[') {
+        let bracket_end = s
+            .find(']')
+            .ok_or_else(|| anyhow::anyhow!("unclosed bracket in '{s}'"))?;
+        let host = s[1..bracket_end].to_string();
+        let rest = &s[bracket_end + 1..];
+        let rest = rest
+            .strip_prefix(':')
+            .ok_or_else(|| anyhow::anyhow!("expected ':' after ']' in '{s}'"))?;
+        return parse_port_and_creds(&host, rest);
     }
 
-    match s.rsplit_once(':') {
-        Some((host, port_str)) => {
-            let port: u16 = port_str.parse().context("invalid port")?;
-            Ok((host.to_string(), port))
+    // Split into parts by ':'
+    let parts: Vec<&str> = s.splitn(4, ':').collect();
+    match parts.len() {
+        2 => {
+            let port: u16 = parts[1].parse().context("invalid port")?;
+            Ok(UpstreamProxy {
+                host: parts[0].to_string(),
+                port,
+                username: None,
+                password: None,
+            })
         }
-        None => anyhow::bail!("expected host:port, got '{}'", s),
+        4 => {
+            let port: u16 = parts[1].parse().context("invalid port")?;
+            Ok(UpstreamProxy {
+                host: parts[0].to_string(),
+                port,
+                username: Some(parts[2].to_string()),
+                password: Some(parts[3].to_string()),
+            })
+        }
+        _ => anyhow::bail!("expected host:port or host:port:user:pass, got '{s}'"),
+    }
+}
+
+fn parse_port_and_creds(host: &str, rest: &str) -> Result<UpstreamProxy> {
+    let parts: Vec<&str> = rest.splitn(3, ':').collect();
+    match parts.len() {
+        1 => {
+            let port: u16 = parts[0].parse().context("invalid port")?;
+            Ok(UpstreamProxy {
+                host: host.to_string(),
+                port,
+                username: None,
+                password: None,
+            })
+        }
+        3 => {
+            let port: u16 = parts[0].parse().context("invalid port")?;
+            Ok(UpstreamProxy {
+                host: host.to_string(),
+                port,
+                username: Some(parts[1].to_string()),
+                password: Some(parts[2].to_string()),
+            })
+        }
+        _ => anyhow::bail!("expected port or port:user:pass after host, got '{rest}'"),
     }
 }
 
@@ -138,18 +186,18 @@ pub fn load_proxy_sets(config: &Config, config_dir: &Path) -> Result<Vec<ProxySe
                 proxies_path.display()
             );
         }
+        let with_creds = proxies.iter().filter(|p| p.username.is_some()).count();
         tracing::info!(
-            "Loaded proxy set '{}': {} proxies from {}",
+            "Loaded proxy set '{}': {} proxies ({} with credentials) from {}",
             ps.name,
             proxies.len(),
+            with_creds,
             proxies_path.display()
         );
         sets.push(ProxySet {
             name: ps.name.clone(),
             proxies,
             session_affinity_secs: ps.session_affinity_secs,
-            upstream_username: ps.upstream_username.clone(),
-            upstream_password: ps.upstream_password.clone(),
         });
     }
     Ok(sets)
@@ -162,33 +210,63 @@ mod tests {
     use tempfile::NamedTempFile;
 
     #[test]
-    fn test_parse_host_port() {
-        let (h, p) = parse_host_port("proxy.example.com:8080").unwrap();
-        assert_eq!(h, "proxy.example.com");
-        assert_eq!(p, 8080);
+    fn test_parse_host_port_only() {
+        let p = parse_proxy_line("proxy.example.com:8080").unwrap();
+        assert_eq!(p.host, "proxy.example.com");
+        assert_eq!(p.port, 8080);
+        assert!(p.username.is_none());
+        assert!(p.password.is_none());
     }
 
     #[test]
-    fn test_parse_host_port_ipv6() {
-        let (h, p) = parse_host_port("[::1]:3128").unwrap();
-        assert_eq!(h, "::1");
-        assert_eq!(p, 3128);
+    fn test_parse_host_port_user_pass() {
+        let p = parse_proxy_line("198.51.100.1:6658:myuser:mypass123").unwrap();
+        assert_eq!(p.host, "198.51.100.1");
+        assert_eq!(p.port, 6658);
+        assert_eq!(p.username.as_deref(), Some("myuser"));
+        assert_eq!(p.password.as_deref(), Some("mypass123"));
     }
 
     #[test]
-    fn test_load_proxies() {
+    fn test_parse_ipv6() {
+        let p = parse_proxy_line("[::1]:3128").unwrap();
+        assert_eq!(p.host, "::1");
+        assert_eq!(p.port, 3128);
+        assert!(p.username.is_none());
+    }
+
+    #[test]
+    fn test_parse_ipv6_with_creds() {
+        let p = parse_proxy_line("[2001:db8::1]:8080:user:pass").unwrap();
+        assert_eq!(p.host, "2001:db8::1");
+        assert_eq!(p.port, 8080);
+        assert_eq!(p.username.as_deref(), Some("user"));
+        assert_eq!(p.password.as_deref(), Some("pass"));
+    }
+
+    #[test]
+    fn test_parse_bad_format() {
+        assert!(parse_proxy_line("host:port:only_three").is_err());
+        assert!(parse_proxy_line("justhost").is_err());
+    }
+
+    #[test]
+    fn test_load_proxies_mixed() {
         let mut f = NamedTempFile::new().unwrap();
         writeln!(f, "# comment").unwrap();
-        writeln!(f, "proxy1.example.com:8080").unwrap();
+        writeln!(f, "198.51.100.1:6658:myuser:mypass").unwrap();
         writeln!(f, "").unwrap();
-        writeln!(f, "proxy2.example.com:3128").unwrap();
+        writeln!(f, "198.51.100.2:7872:myuser:mypass").unwrap();
+        writeln!(f, "plain.proxy.com:3128").unwrap();
         f.flush().unwrap();
 
         let proxies = load_proxies(f.path()).unwrap();
-        assert_eq!(proxies.len(), 2);
-        assert_eq!(proxies[0].host, "proxy1.example.com");
-        assert_eq!(proxies[0].port, 8080);
-        assert_eq!(proxies[1].host, "proxy2.example.com");
-        assert_eq!(proxies[1].port, 3128);
+        assert_eq!(proxies.len(), 3);
+        assert_eq!(proxies[0].host, "198.51.100.1");
+        assert_eq!(proxies[0].port, 6658);
+        assert_eq!(proxies[0].username.as_deref(), Some("myuser"));
+        assert_eq!(proxies[1].username.as_deref(), Some("myuser"));
+        assert_eq!(proxies[2].host, "plain.proxy.com");
+        assert!(proxies[2].username.is_none());
     }
 }

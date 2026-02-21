@@ -1,5 +1,7 @@
-# Residential proxy pool
+# Residential static proxies
 # Format: host:port:username:password
 198.51.100.1:6658:exampleuser:examplepass
 198.51.100.2:7872:exampleuser:examplepass
 198.51.100.3:5432:exampleuser:examplepass
+198.51.100.4:6658:exampleuser:examplepass
+198.51.100.5:7872:exampleuser:examplepass

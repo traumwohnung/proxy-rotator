@@ -1,0 +1,15 @@
+services:
+  proxy-rotator:
+    image: ghcr.io/1cedsoda/proxy-rotator:main
+    # Or build locally:
+    # build:
+    #   context: ..
+    #   dockerfile: Dockerfile
+    ports:
+      - "8100:8100"
+    volumes:
+      - ./config.toml:/data/config/config.toml:ro
+      - ./proxies:/data/config/proxies:ro
+    environment:
+      - RUST_LOG=info
+    restart: unless-stopped
