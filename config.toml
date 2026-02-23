@@ -2,9 +2,16 @@
 #
 # Usage: cargo run
 #
-# Clients select a proxy set via Proxy-Authorization: Basic base64(set_name:)
-# Optional session ID: base64(set_name-session_id:)
-# No password is required.
+# Clients use Proxy-Authorization with username format:
+#   <proxyset>-<minutes>-<sessionkey>
+#
+# Examples:
+#   curl -x http://127.0.0.1:8100 --proxy-user "residential-5-abc123:" https://...
+#   curl -x http://127.0.0.1:8100 --proxy-user "datacenter-0-req1:" https://...
+#
+# - proxyset: alphanumeric name matching a proxy set below
+# - minutes: 0 (new IP every request) to 1440 (24h sticky session)
+# - sessionkey: alphanumeric session identifier
 
 bind_addr = "127.0.0.1:8100"
 log_level = "info"
@@ -12,9 +19,7 @@ log_level = "info"
 [[proxy_set]]
 name = "residential"
 proxies_file = "deployment/config/residential.txt"
-session_affinity_secs = 300
 
 [[proxy_set]]
 name = "datacenter"
 proxies_file = "deployment/config/datacenter.txt"
-session_affinity_secs = 0

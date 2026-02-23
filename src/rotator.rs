@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 
 /// A proxy rotator that manages multiple proxy sets.
 /// Each set picks the least-used proxy (with random tie-breaking)
-/// and supports optional session affinity.
+/// and supports per-request session affinity via the username format:
+///   <proxyset>-<minutes>-<sessionkey>
 pub struct Rotator {
     sets: Vec<RotatorSet>,
 }
@@ -15,7 +16,9 @@ pub struct Rotator {
 struct RotatorSet {
     name: String,
     proxies: Vec<ProxyEntry>,
-    affinity: Option<AffinityTable>,
+    /// Dynamic affinity table: keyed by "<minutes>:<sessionkey>", each entry
+    /// stores the assigned proxy index, the timestamp, and the duration.
+    affinity_map: DashMap<String, AffinityEntry>,
 }
 
 struct ProxyEntry {
@@ -23,15 +26,10 @@ struct ProxyEntry {
     use_count: AtomicU64,
 }
 
-struct AffinityTable {
-    duration: Duration,
-    /// Keyed by session key: either the client IP (default) or a client-provided session ID.
-    map: DashMap<String, AffinityEntry>,
-}
-
 struct AffinityEntry {
     proxy_index: usize,
     assigned_at: Instant,
+    duration: Duration,
 }
 
 /// The resolved upstream proxy for a request.
@@ -49,14 +47,6 @@ impl Rotator {
         let sets = sets
             .into_iter()
             .map(|ps| {
-                let affinity = if ps.session_affinity_secs > 0 {
-                    Some(AffinityTable {
-                        duration: Duration::from_secs(ps.session_affinity_secs),
-                        map: DashMap::new(),
-                    })
-                } else {
-                    None
-                };
                 let proxies = ps
                     .proxies
                     .into_iter()
@@ -68,7 +58,7 @@ impl Rotator {
                 RotatorSet {
                     name: ps.name,
                     proxies,
-                    affinity,
+                    affinity_map: DashMap::new(),
                 }
             })
             .collect();
@@ -76,16 +66,16 @@ impl Rotator {
     }
 
     /// Find a proxy set by name and return the next proxy.
-    /// Uses least-used selection with random tie-breaking.
-    /// Credentials come from the proxy entry itself.
-    /// `session_key` identifies the session for affinity (defaults to client IP).
+    /// `affinity_minutes` controls sticky session duration (0 = no affinity).
+    /// `session_key` identifies the session for affinity.
     pub fn next_proxy(
         &self,
         set_name: &str,
+        affinity_minutes: u16,
         session_key: &str,
     ) -> Option<ResolvedProxy> {
         let set = self.sets.iter().find(|s| s.name == set_name)?;
-        let proxy = set.pick(session_key);
+        let proxy = set.pick(affinity_minutes, session_key);
         Some(ResolvedProxy {
             host: proxy.host.clone(),
             port: proxy.port,
@@ -99,46 +89,46 @@ impl Rotator {
         self.sets.iter().map(|s| s.name.as_str()).collect()
     }
 
-    /// Get stats about a proxy set: (proxy_count, affinity_secs).
-    pub fn set_info(&self, name: &str) -> Option<(usize, u64)> {
-        self.sets.iter().find(|s| s.name == name).map(|s| {
-            let affinity_secs = s
-                .affinity
-                .as_ref()
-                .map(|a| a.duration.as_secs())
-                .unwrap_or(0);
-            (s.proxies.len(), affinity_secs)
-        })
+    /// Get stats about a proxy set: proxy count.
+    pub fn set_info(&self, name: &str) -> Option<usize> {
+        self.sets
+            .iter()
+            .find(|s| s.name == name)
+            .map(|s| s.proxies.len())
     }
 }
 
 impl RotatorSet {
-    fn pick(&self, session_key: &str) -> &UpstreamProxy {
-        if let Some(affinity) = &self.affinity {
-            // Check for a valid affinity entry.
-            if let Some(entry) = affinity.map.get(session_key) {
-                if entry.assigned_at.elapsed() < affinity.duration {
-                    let idx = entry.proxy_index;
-                    self.proxies[idx].use_count.fetch_add(1, Ordering::Relaxed);
-                    return &self.proxies[idx].proxy;
-                }
-            }
-
-            // Assign via least-used selection.
-            let idx = self.pick_least_used();
-            affinity.map.insert(
-                session_key.to_string(),
-                AffinityEntry {
-                    proxy_index: idx,
-                    assigned_at: Instant::now(),
-                },
-            );
-            &self.proxies[idx].proxy
-        } else {
+    fn pick(&self, affinity_minutes: u16, session_key: &str) -> &UpstreamProxy {
+        if affinity_minutes == 0 {
             // No affinity — pure least-used selection.
             let idx = self.pick_least_used();
-            &self.proxies[idx].proxy
+            return &self.proxies[idx].proxy;
         }
+
+        let duration = Duration::from_secs(affinity_minutes as u64 * 60);
+        let affinity_key = format!("{}:{}", affinity_minutes, session_key);
+
+        // Check for a valid affinity entry.
+        if let Some(entry) = self.affinity_map.get(&affinity_key) {
+            if entry.assigned_at.elapsed() < entry.duration {
+                let idx = entry.proxy_index;
+                self.proxies[idx].use_count.fetch_add(1, Ordering::Relaxed);
+                return &self.proxies[idx].proxy;
+            }
+        }
+
+        // Assign via least-used selection.
+        let idx = self.pick_least_used();
+        self.affinity_map.insert(
+            affinity_key,
+            AffinityEntry {
+                proxy_index: idx,
+                assigned_at: Instant::now(),
+                duration,
+            },
+        );
+        &self.proxies[idx].proxy
     }
 
     /// Pick the proxy with the lowest use_count.
@@ -205,18 +195,15 @@ pub fn spawn_affinity_cleanup(rotator: Arc<Rotator>) {
         loop {
             interval.tick().await;
             for set in &rotator.sets {
-                if let Some(affinity) = &set.affinity {
-                    let before = affinity.map.len();
-                    affinity
-                        .map
-                        .retain(|_, entry| entry.assigned_at.elapsed() < affinity.duration);
-                    let removed = before - affinity.map.len();
-                    if removed > 0 {
-                        tracing::debug!(
-                            "Cleaned {removed} expired affinity entries from set '{}'",
-                            set.name
-                        );
-                    }
+                let before = set.affinity_map.len();
+                set.affinity_map
+                    .retain(|_, entry| entry.assigned_at.elapsed() < entry.duration);
+                let removed = before - set.affinity_map.len();
+                if removed > 0 {
+                    tracing::debug!(
+                        "Cleaned {removed} expired affinity entries from set '{}'",
+                        set.name
+                    );
                 }
             }
         }
@@ -229,7 +216,7 @@ mod tests {
     use crate::config::{ProxySet, UpstreamProxy};
     use std::collections::HashMap;
 
-    fn make_test_set(n: usize, affinity_secs: u64) -> ProxySet {
+    fn make_test_set(n: usize) -> ProxySet {
         let proxies = (0..n)
             .map(|i| UpstreamProxy {
                 host: format!("proxy{i}.example.com"),
@@ -241,17 +228,16 @@ mod tests {
         ProxySet {
             name: "test".to_string(),
             proxies,
-            session_affinity_secs: affinity_secs,
         }
     }
 
     #[test]
     fn test_least_used_distributes_evenly() {
-        let rotator = Rotator::new(vec![make_test_set(4, 0)]);
+        let rotator = Rotator::new(vec![make_test_set(4)]);
 
         let mut counts: HashMap<String, usize> = HashMap::new();
         for _ in 0..400 {
-            let p = rotator.next_proxy("test", "127.0.0.1").unwrap();
+            let p = rotator.next_proxy("test", 0, "abc123").unwrap();
             *counts.entry(p.host.clone()).or_default() += 1;
         }
 
@@ -266,37 +252,51 @@ mod tests {
 
     #[test]
     fn test_credentials_from_proxy_entry() {
-        let rotator = Rotator::new(vec![make_test_set(1, 0)]);
-        let p = rotator.next_proxy("test", "127.0.0.1").unwrap();
+        let rotator = Rotator::new(vec![make_test_set(1)]);
+        let p = rotator.next_proxy("test", 0, "abc123").unwrap();
         assert_eq!(p.username.as_deref(), Some("testuser"));
         assert_eq!(p.password.as_deref(), Some("testpass"));
     }
 
     #[test]
-    fn test_session_affinity_by_ip() {
-        let rotator = Rotator::new(vec![make_test_set(4, 300)]);
+    fn test_session_affinity_with_minutes() {
+        let rotator = Rotator::new(vec![make_test_set(4)]);
 
-        // Same session key → same proxy
-        let p1a = rotator.next_proxy("test", "10.0.0.1").unwrap();
-        let p1b = rotator.next_proxy("test", "10.0.0.1").unwrap();
+        // Same session key with affinity → same proxy
+        let p1a = rotator.next_proxy("test", 5, "sess1").unwrap();
+        let p1b = rotator.next_proxy("test", 5, "sess1").unwrap();
         assert_eq!(p1a.host, p1b.host, "Same session key should get same proxy");
 
         // Different session key → may get a different proxy
-        let p2 = rotator.next_proxy("test", "10.0.0.2").unwrap();
+        let p2 = rotator.next_proxy("test", 5, "sess2").unwrap();
         assert!(p2.host.starts_with("proxy"));
     }
 
     #[test]
-    fn test_session_affinity_with_session_ids() {
-        let rotator = Rotator::new(vec![make_test_set(4, 300)]);
+    fn test_zero_minutes_no_affinity() {
+        let rotator = Rotator::new(vec![make_test_set(4)]);
 
-        // Different session IDs get independent affinity
-        let pa1 = rotator.next_proxy("test", "sess1").unwrap();
-        let pa2 = rotator.next_proxy("test", "sess1").unwrap();
+        // With 0 minutes, should rotate (least-used), not stick
+        let mut hosts = Vec::new();
+        for _ in 0..4 {
+            let p = rotator.next_proxy("test", 0, "samekey").unwrap();
+            hosts.push(p.host);
+        }
+        hosts.sort();
+        hosts.dedup();
+        assert_eq!(hosts.len(), 4, "0 minutes should distribute across all proxies");
+    }
+
+    #[test]
+    fn test_different_session_keys_independent_affinity() {
+        let rotator = Rotator::new(vec![make_test_set(4)]);
+
+        let pa1 = rotator.next_proxy("test", 10, "sessA").unwrap();
+        let pa2 = rotator.next_proxy("test", 10, "sessA").unwrap();
         assert_eq!(pa1.host, pa2.host, "Same session should get same proxy");
 
-        let pb1 = rotator.next_proxy("test", "sess2").unwrap();
-        let pb2 = rotator.next_proxy("test", "sess2").unwrap();
+        let pb1 = rotator.next_proxy("test", 10, "sessB").unwrap();
+        let pb2 = rotator.next_proxy("test", 10, "sessB").unwrap();
         assert_eq!(pb1.host, pb2.host, "Same session should get same proxy");
 
         assert!(pa1.host.starts_with("proxy"));
@@ -305,8 +305,8 @@ mod tests {
 
     #[test]
     fn test_unknown_set_returns_none() {
-        let rotator = Rotator::new(vec![make_test_set(2, 0)]);
-        assert!(rotator.next_proxy("nonexistent", "127.0.0.1").is_none());
+        let rotator = Rotator::new(vec![make_test_set(2)]);
+        assert!(rotator.next_proxy("nonexistent", 0, "abc123").is_none());
     }
 
     #[test]

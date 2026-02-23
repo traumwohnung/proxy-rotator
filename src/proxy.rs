@@ -21,14 +21,14 @@ pub async fn run_proxy(bind_addr: &str, rotator: Arc<Rotator>) -> Result<()> {
     info!("Proxy rotator listening on {bind_addr}");
     info!("Available proxy sets: {:?}", rotator.set_names());
     for name in rotator.set_names() {
-        if let Some((count, affinity)) = rotator.set_info(name) {
-            info!(
-                "  set '{}': {} proxies, affinity={}s",
-                name, count, affinity
-            );
+        if let Some(count) = rotator.set_info(name) {
+            info!("  set '{}': {} proxies", name, count);
         }
     }
-    info!("Usage: Proxy-Authorization: Basic base64(proxy_set_name:) or base64(proxy_set_name-session_id:)");
+    info!("Usage: Proxy-Authorization: Basic base64(<proxyset>-<minutes>-<sessionkey>:)");
+    info!("  proxyset: alphanumeric proxy set name");
+    info!("  minutes: 0 (rotate every request) to 1440 (24h sticky session)");
+    info!("  sessionkey: alphanumeric session identifier");
 
     loop {
         let (stream, peer) = listener.accept().await?;
@@ -70,55 +70,106 @@ pub async fn run_proxy(bind_addr: &str, rotator: Arc<Rotator>) -> Result<()> {
 // Proxy-Authorization parsing
 // ---------------------------------------------------------------------------
 
-/// Parsed proxy authorization: proxy set name and optional session ID.
+/// Parsed proxy authorization: proxy set name, affinity minutes, and session key.
 struct ProxyAuth {
     set_name: String,
-    session_id: Option<String>,
+    affinity_minutes: u16,
+    session_key: String,
 }
 
-/// Parse the Proxy-Authorization header.
-/// Format: `Basic base64(username:)`
-/// Username is either `proxy_set_name` or `proxy_set_name-session_id`.
-/// The session_id must be alphanumeric. Password is unused (empty).
-fn parse_proxy_auth(req: &Request<Incoming>) -> Option<ProxyAuth> {
+/// Extract and parse the Proxy-Authorization header from a request.
+fn parse_proxy_auth(req: &Request<Incoming>) -> Result<ProxyAuth, String> {
     let header_val = req
         .headers()
         .get("proxy-authorization")
-        .and_then(|v| v.to_str().ok())?;
+        .and_then(|v| v.to_str().ok())
+        .ok_or("Missing Proxy-Authorization header")?;
 
-    let b64 = header_val.strip_prefix("Basic ")?;
-    let decoded = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
-    let decoded_str = String::from_utf8(decoded).ok()?;
+    parse_proxy_auth_value(header_val)
+}
 
-    // Standard Basic auth: split on first ':'
+/// Parse a Proxy-Authorization header value.
+/// Format: `Basic base64(<proxyset>-<minutes>-<sessionkey>:)`
+///
+/// All three parts are required. The format is strictly:
+///   - proxyset: alphanumeric only (no hyphens)
+///   - minutes: numeric only, 0..=1440
+///   - sessionkey: alphanumeric only (no hyphens)
+///
+/// Password (after the colon) is unused/empty.
+fn parse_proxy_auth_value(header_val: &str) -> Result<ProxyAuth, String> {
+    let b64 = header_val
+        .strip_prefix("Basic ")
+        .ok_or("Proxy-Authorization must be Basic auth")?;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .map_err(|_| "Invalid base64 in Proxy-Authorization")?;
+    let decoded_str =
+        String::from_utf8(decoded).map_err(|_| "Invalid UTF-8 in Proxy-Authorization")?;
+
+    // Standard Basic auth: split on first ':' to get the username part.
     let username = match decoded_str.find(':') {
         Some(idx) => &decoded_str[..idx],
         None => decoded_str.as_str(),
     };
 
     if username.is_empty() {
-        return None;
+        return Err("Empty username in Proxy-Authorization".to_string());
     }
 
-    // Split on first '-' to separate set_name from session_id.
-    // Only treat the suffix as a session_id if it's non-empty and alphanumeric.
-    if let Some(dash_pos) = username.find('-') {
-        let set_part = &username[..dash_pos];
-        let session_part = &username[dash_pos + 1..];
-        if !set_part.is_empty()
-            && !session_part.is_empty()
-            && session_part.chars().all(|c| c.is_ascii_alphanumeric())
-        {
-            return Some(ProxyAuth {
-                set_name: set_part.to_string(),
-                session_id: Some(session_part.to_string()),
-            });
-        }
+    // Split username on '-' — must have exactly 3 parts: proxyset-minutes-sessionkey
+    let parts: Vec<&str> = username.splitn(3, '-').collect();
+    if parts.len() != 3 {
+        return Err(format!(
+            "Invalid username format '{}'. Expected: <proxyset>-<minutes>-<sessionkey>",
+            username
+        ));
     }
 
-    Some(ProxyAuth {
-        set_name: username.to_string(),
-        session_id: None,
+    let set_name = parts[0];
+    let minutes_str = parts[1];
+    let session_key = parts[2];
+
+    // Validate proxyset: non-empty, alphanumeric only
+    if set_name.is_empty() || !set_name.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return Err(format!(
+            "Invalid proxy set name '{}'. Must be non-empty and alphanumeric only (no hyphens).",
+            set_name
+        ));
+    }
+
+    // Validate minutes: numeric only, 0..=1440
+    if minutes_str.is_empty() || !minutes_str.chars().all(|c| c.is_ascii_digit()) {
+        return Err(format!(
+            "Invalid minutes '{}'. Must be a number 0-1440.",
+            minutes_str
+        ));
+    }
+    let minutes: u16 = minutes_str.parse::<u16>().map_err(|_| {
+        format!(
+            "Invalid minutes '{}'. Must be a number 0-1440.",
+            minutes_str
+        )
+    })?;
+    if minutes > 1440 {
+        return Err(format!(
+            "Minutes {} exceeds maximum of 1440 (24 hours).",
+            minutes
+        ));
+    }
+
+    // Validate session key: non-empty, alphanumeric only
+    if session_key.is_empty() || !session_key.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return Err(format!(
+            "Invalid session key '{}'. Must be non-empty and alphanumeric only (no hyphens).",
+            session_key
+        ));
+    }
+
+    Ok(ProxyAuth {
+        set_name: set_name.to_string(),
+        affinity_minutes: minutes,
+        session_key: session_key.to_string(),
     })
 }
 
@@ -150,49 +201,39 @@ async fn handle_request_inner(
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>> {
     let client_ip = peer.ip();
 
-    // Parse the proxy set name and optional session ID from Proxy-Authorization.
-    let (set_name, session_id) = match parse_proxy_auth(&req) {
-        Some(auth) => (auth.set_name, auth.session_id),
-        None => {
-            // If there's only one proxy set, use it as default.
-            let names = rotator.set_names();
-            if names.len() == 1 {
-                (names[0].to_string(), None)
-            } else {
-                warn!(
-                    method = %req.method(),
-                    uri = %req.uri(),
-                    "Missing or empty Proxy-Authorization username"
-                );
-                return Ok(proxy_auth_error(&format!(
-                    "Proxy-Authorization required. Available sets: {:?}",
-                    rotator.set_names()
-                )));
-            }
+    // Parse the proxy auth: <proxyset>-<minutes>-<sessionkey>
+    let auth = match parse_proxy_auth(&req) {
+        Ok(auth) => auth,
+        Err(msg) => {
+            warn!(
+                method = %req.method(),
+                uri = %req.uri(),
+                client = %client_ip,
+                "Auth error: {msg}"
+            );
+            return Ok(proxy_auth_error(&format!(
+                "{}. Format: <proxyset>-<minutes>-<sessionkey>. Available sets: {:?}",
+                msg,
+                rotator.set_names()
+            )));
         }
     };
 
-    // Session key: use session_id if provided, otherwise fall back to client IP.
-    let session_key = session_id
-        .as_deref()
-        .unwrap_or(&client_ip.to_string())
-        .to_string();
-
     // Resolve the next upstream proxy.
-    let upstream = match rotator.next_proxy(&set_name, &session_key) {
+    let upstream = match rotator.next_proxy(&auth.set_name, auth.affinity_minutes, &auth.session_key) {
         Some(p) => p,
         None => {
             warn!(
                 method = %req.method(),
                 uri = %req.uri(),
-                set = %set_name,
+                set = %auth.set_name,
                 "Unknown proxy set"
             );
             return Ok(error_response(
                 StatusCode::BAD_REQUEST,
                 format!(
                     "Unknown proxy set '{}'. Available: {:?}",
-                    set_name,
+                    auth.set_name,
                     rotator.set_names()
                 ),
             ));
@@ -202,8 +243,9 @@ async fn handle_request_inner(
     info!(
         method = %req.method(),
         uri = %req.uri(),
-        set = %set_name,
-        session = session_id.as_deref().unwrap_or("-"),
+        set = %auth.set_name,
+        minutes = auth.affinity_minutes,
+        session = %auth.session_key,
         upstream = %format!("{}:{}", upstream.host, upstream.port),
         client = %client_ip,
         "Routing request"
@@ -350,4 +392,105 @@ fn proxy_auth_error(message: &str) -> Response<BoxBody<Bytes, hyper::Error>> {
                 .boxed(),
         )
         .unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper to build a Basic auth header value from a username.
+    fn auth_header(username: &str) -> String {
+        let encoded =
+            base64::engine::general_purpose::STANDARD.encode(format!("{username}:"));
+        format!("Basic {encoded}")
+    }
+
+    #[test]
+    fn test_valid_username() {
+        let auth = parse_proxy_auth_value(&auth_header("residential-5-abc123")).unwrap();
+        assert_eq!(auth.set_name, "residential");
+        assert_eq!(auth.affinity_minutes, 5);
+        assert_eq!(auth.session_key, "abc123");
+    }
+
+    #[test]
+    fn test_zero_minutes() {
+        let auth = parse_proxy_auth_value(&auth_header("datacenter-0-sess1")).unwrap();
+        assert_eq!(auth.set_name, "datacenter");
+        assert_eq!(auth.affinity_minutes, 0);
+        assert_eq!(auth.session_key, "sess1");
+    }
+
+    #[test]
+    fn test_max_minutes() {
+        let auth = parse_proxy_auth_value(&auth_header("residential-1440-mykey")).unwrap();
+        assert_eq!(auth.affinity_minutes, 1440);
+    }
+
+    #[test]
+    fn test_minutes_too_high() {
+        assert!(parse_proxy_auth_value(&auth_header("residential-1441-mykey")).is_err());
+    }
+
+    #[test]
+    fn test_missing_parts() {
+        // Only one part (no hyphens)
+        assert!(parse_proxy_auth_value(&auth_header("residential")).is_err());
+        // Only two parts
+        assert!(parse_proxy_auth_value(&auth_header("residential-5")).is_err());
+    }
+
+    #[test]
+    fn test_hyphen_in_proxyset() {
+        // splitn(3, '-') → ["resi", "dential", "5-abc123"]
+        // "dential" is not numeric → error
+        assert!(parse_proxy_auth_value(&auth_header("resi-dential-5-abc123")).is_err());
+    }
+
+    #[test]
+    fn test_hyphen_in_session_key() {
+        // splitn(3, '-') → ["residential", "5", "abc-123"]
+        // "abc-123" has a hyphen → not alphanumeric → error
+        assert!(parse_proxy_auth_value(&auth_header("residential-5-abc-123")).is_err());
+    }
+
+    #[test]
+    fn test_non_alphanumeric_proxyset() {
+        assert!(parse_proxy_auth_value(&auth_header("resi_dential-5-abc123")).is_err());
+    }
+
+    #[test]
+    fn test_non_alphanumeric_session_key() {
+        assert!(parse_proxy_auth_value(&auth_header("residential-5-abc_123")).is_err());
+    }
+
+    #[test]
+    fn test_non_numeric_minutes() {
+        assert!(parse_proxy_auth_value(&auth_header("residential-abc-sess1")).is_err());
+    }
+
+    #[test]
+    fn test_empty_proxyset() {
+        assert!(parse_proxy_auth_value(&auth_header("-5-sess1")).is_err());
+    }
+
+    #[test]
+    fn test_empty_session_key() {
+        assert!(parse_proxy_auth_value(&auth_header("residential-5-")).is_err());
+    }
+
+    #[test]
+    fn test_empty_minutes() {
+        assert!(parse_proxy_auth_value(&auth_header("residential--sess1")).is_err());
+    }
+
+    #[test]
+    fn test_not_basic_auth() {
+        assert!(parse_proxy_auth_value("Bearer token123").is_err());
+    }
+
+    #[test]
+    fn test_empty_username() {
+        assert!(parse_proxy_auth_value(&auth_header("")).is_err());
+    }
 }

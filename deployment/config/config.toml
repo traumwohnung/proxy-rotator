@@ -1,8 +1,15 @@
 # Proxy Rotator — Production Configuration
 #
-# Clients select a proxy set via:
-#   curl -x http://proxy-rotator:8100 --proxy-user "residential:" https://...
-#   curl -x http://proxy-rotator:8100 --proxy-user "datacenter:" https://...
+# Clients use Proxy-Authorization with username format:
+#   <proxyset>-<minutes>-<sessionkey>
+#
+# Examples:
+#   curl -x http://proxy-rotator:8100 --proxy-user "residential-5-abc123:" https://...
+#   curl -x http://proxy-rotator:8100 --proxy-user "datacenter-0-req1:" https://...
+#
+# - proxyset: alphanumeric name matching a proxy set below
+# - minutes: 0 (new IP every request) to 1440 (24h sticky session)
+# - sessionkey: alphanumeric session identifier
 
 bind_addr = "0.0.0.0:8100"
 log_level = "info"
@@ -10,9 +17,7 @@ log_level = "info"
 [[proxy_set]]
 name = "residential"
 proxies_file = "residential.txt"
-session_affinity_secs = 300
 
 [[proxy_set]]
 name = "datacenter"
 proxies_file = "datacenter.txt"
-session_affinity_secs = 0

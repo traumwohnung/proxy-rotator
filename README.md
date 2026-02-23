@@ -1,6 +1,6 @@
 # proxy-rotator
 
-A Rust HTTP proxy server that load-balances requests across pools of upstream proxies with least-used rotation and optional session affinity.
+A Rust HTTP proxy server that load-balances requests across pools of upstream proxies with least-used rotation and per-request session affinity.
 
 ## Architecture
 
@@ -11,7 +11,7 @@ Client ──HTTP/CONNECT──→ proxy-rotator ──→ upstream proxy pool �
 - **No TLS termination** — raw bytes are relayed through CONNECT tunnels. The client's own TLS handshake reaches the destination untouched.
 - Multiple **proxy sets** — each with its own pool of upstream proxies and rotation strategy.
 - **Least-used rotation** — requests go to the proxy with the lowest use count, with random tie-breaking among equally-used proxies.
-- **Session affinity** — optionally pin a client IP (+ optional session ID) to the same upstream proxy for a configurable duration.
+- **Per-request session affinity** — controlled via the username, pin a session key to the same upstream proxy for a specified duration (0–1440 minutes).
 - **Per-proxy credentials** — each proxy entry includes its own username:password.
 
 ## Configuration
@@ -25,12 +25,10 @@ log_level = "info"
 [[proxy_set]]
 name = "residential"
 proxies_file = "proxies/residential.txt"
-session_affinity_secs = 300         # same client IP → same proxy for 5 min
 
 [[proxy_set]]
 name = "datacenter"
 proxies_file = "proxies/datacenter.txt"
-session_affinity_secs = 0           # pure least-used rotation
 ```
 
 ### Proxy list files
@@ -59,31 +57,45 @@ cargo build --release
 
 ### Client usage
 
-Clients select a proxy set via the `Proxy-Authorization` header. The **username** is the proxy set name, optionally followed by `-session_id` (alphanumeric) for session control. The **password** is empty (unused):
+Clients select a proxy set and control session affinity via the `Proxy-Authorization` header. The **username** format is strictly:
+
+```
+<proxyset>-<minutes>-<sessionkey>
+```
+
+| Part | Rules | Description |
+|------|-------|-------------|
+| `proxyset` | Alphanumeric only | Name of the proxy set to use |
+| `minutes` | Number 0–1440 | Sticky session duration. `0` = new IP every request, `1440` = 24 hours |
+| `sessionkey` | Alphanumeric only | Session identifier for affinity grouping |
+
+The **password** is empty (unused). All three parts are required. No hyphens allowed within any part.
 
 ```bash
-# Use the "residential" proxy set
+# Rotate every request (minutes=0) — each request gets a different proxy
 curl -x http://127.0.0.1:8100 \
-  --proxy-user "residential:" \
+  --proxy-user "residential-0-req1:" \
   https://httpbin.org/ip
 
-# Use the "datacenter" proxy set
+# 5-minute sticky session — same session key reuses the same proxy for 5 min
 curl -x http://127.0.0.1:8100 \
-  --proxy-user "datacenter:" \
+  --proxy-user "residential-5-abc123:" \
   https://httpbin.org/ip
 
-# Use a specific session (same session ID → same upstream proxy for the affinity window)
+# Different session key → independent proxy assignment
 curl -x http://127.0.0.1:8100 \
-  --proxy-user "residential-abc123:" \
+  --proxy-user "residential-5-xyz789:" \
   https://httpbin.org/ip
 
-# Different session ID → independent upstream proxy selection
+# Use the "datacenter" proxy set with 10-minute affinity
 curl -x http://127.0.0.1:8100 \
-  --proxy-user "residential-xyz789:" \
+  --proxy-user "datacenter-10-mysess:" \
   https://httpbin.org/ip
 
-# If only one proxy set is configured, auth can be omitted
-curl -x http://127.0.0.1:8100 https://httpbin.org/ip
+# 24-hour sticky session
+curl -x http://127.0.0.1:8100 \
+  --proxy-user "residential-1440-longrun:" \
+  https://httpbin.org/ip
 ```
 
 ### Environment variables
@@ -95,11 +107,12 @@ curl -x http://127.0.0.1:8100 https://httpbin.org/ip
 ## How It Works
 
 1. Client connects and sends an HTTP request or CONNECT tunnel request
-2. The proxy set (and optional session ID) is parsed from `Proxy-Authorization: Basic base64(set_name-session_id:)`
+2. The username is parsed from `Proxy-Authorization: Basic base64(<proxyset>-<minutes>-<sessionkey>:)`
 3. An upstream proxy is chosen using **least-used rotation** (lowest use count, random tie-breaking)
-4. Credentials from the proxy entry (`host:port:user:pass`) are forwarded to the upstream proxy
-5. For **CONNECT**: a tunnel is established through the upstream proxy, then raw bytes are relayed bidirectionally — no TLS breaking
-6. For **plain HTTP**: the request is forwarded through the upstream proxy with the absolute URI
+4. If `minutes > 0`, the session key is pinned to that proxy for the specified duration
+5. Credentials from the proxy entry (`host:port:user:pass`) are forwarded to the upstream proxy
+6. For **CONNECT**: a tunnel is established through the upstream proxy, then raw bytes are relayed bidirectionally — no TLS breaking
+7. For **plain HTTP**: the request is forwarded through the upstream proxy with the absolute URI
 
 ### Least-used rotation
 
@@ -112,7 +125,9 @@ This ensures even distribution while avoiding predictable patterns.
 
 ### Session affinity
 
-When `session_affinity_secs > 0`, the first request from a client IP (+ session ID, if provided) gets assigned an upstream proxy via least-used selection. Subsequent requests with the same IP and session ID reuse that proxy until the affinity window expires. Different session IDs from the same client get independent upstream proxy assignments, allowing one client to maintain multiple concurrent sessions through different proxies. Expired entries are cleaned up every 60 seconds.
+When `minutes > 0`, the first request with a given session key gets assigned an upstream proxy via least-used selection. Subsequent requests with the same session key and minutes value reuse that proxy until the affinity window expires. Different session keys get independent upstream proxy assignments, allowing one client to maintain multiple concurrent sessions through different proxies. Expired entries are cleaned up every 60 seconds.
+
+When `minutes = 0`, every request goes through pure least-used rotation with no stickiness.
 
 ## Docker
 

@@ -29,12 +29,6 @@ pub struct ProxySetConfig {
     /// Path to the proxies file (one proxy per line).
     /// Format: host:port:username:password  or  host:port
     pub proxies_file: PathBuf,
-
-    /// Session affinity duration in seconds.
-    /// When set, the same client IP will be routed to the same upstream proxy
-    /// for this duration. 0 = no affinity (pure least-used rotation).
-    #[serde(default)]
-    pub session_affinity_secs: u64,
 }
 
 fn default_bind_addr() -> String {
@@ -59,7 +53,6 @@ pub struct UpstreamProxy {
 pub struct ProxySet {
     pub name: String,
     pub proxies: Vec<UpstreamProxy>,
-    pub session_affinity_secs: u64,
 }
 
 impl Config {
@@ -197,7 +190,6 @@ pub fn load_proxy_sets(config: &Config, config_dir: &Path) -> Result<Vec<ProxySe
         sets.push(ProxySet {
             name: ps.name.clone(),
             proxies,
-            session_affinity_secs: ps.session_affinity_secs,
         });
     }
     Ok(sets)
