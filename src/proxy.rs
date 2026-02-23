@@ -15,8 +15,9 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing::{debug, error, info, warn};
 
-pub async fn run_proxy(bind_addr: &str, rotator: Arc<Rotator>) -> Result<()> {
+pub async fn run_proxy(bind_addr: &str, rotator: Arc<Rotator>, api_key: Option<String>) -> Result<()> {
     let listener = TcpListener::bind(bind_addr).await?;
+    let api_key: Arc<Option<String>> = Arc::new(api_key);
 
     info!("Proxy rotator listening on {bind_addr}");
     info!("Available proxy sets: {:?}", rotator.set_names());
@@ -29,12 +30,18 @@ pub async fn run_proxy(bind_addr: &str, rotator: Arc<Rotator>) -> Result<()> {
     info!("  proxyset: alphanumeric proxy set name");
     info!("  minutes: 0 (rotate every request) to 1440 (24h sticky session)");
     info!("  sessionkey: alphanumeric session identifier");
+    if api_key.is_some() {
+        info!("API endpoints enabled: GET /api/sessions, GET /api/sessions/:username");
+    } else {
+        info!("API endpoints disabled (no api_key configured)");
+    }
 
     loop {
         let (stream, peer) = listener.accept().await?;
         debug!("Accepted connection from {peer}");
 
         let rotator = Arc::clone(&rotator);
+        let api_key = Arc::clone(&api_key);
         tokio::spawn(async move {
             let io = TokioIo::new(stream);
 
@@ -45,7 +52,8 @@ pub async fn run_proxy(bind_addr: &str, rotator: Arc<Rotator>) -> Result<()> {
                     io,
                     service_fn(move |req| {
                         let rotator = Arc::clone(&rotator);
-                        async move { handle_request(req, rotator, peer).await }
+                        let api_key = Arc::clone(&api_key);
+                        async move { handle_request(req, rotator, peer, api_key).await }
                     }),
                 )
                 .with_upgrades()
@@ -181,7 +189,16 @@ async fn handle_request(
     req: Request<Incoming>,
     rotator: Arc<Rotator>,
     peer: SocketAddr,
+    api_key: Arc<Option<String>>,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
+    // Check if this is an API request (non-CONNECT with /api/ path).
+    if req.method() != Method::CONNECT {
+        let path = req.uri().path();
+        if path.starts_with("/api/") {
+            return Ok(handle_api_request(&req, &rotator, &api_key));
+        }
+    }
+
     match handle_request_inner(req, rotator, peer).await {
         Ok(resp) => Ok(resp),
         Err(e) => {
@@ -357,6 +374,68 @@ fn parse_raw_response(raw: &[u8]) -> Result<Response<BoxBody<Bytes, hyper::Error
         .boxed();
 
     Ok(builder.body(body).unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// API routing
+// ---------------------------------------------------------------------------
+
+/// Route `/api/*` requests to the appropriate handler in `crate::api`.
+/// `/api/openapi.json` is publicly accessible; all others require Bearer auth.
+fn handle_api_request(
+    req: &Request<Incoming>,
+    rotator: &Rotator,
+    api_key: &Option<String>,
+) -> Response<BoxBody<Bytes, hyper::Error>> {
+    use crate::api;
+
+    let path = req.uri().path();
+
+    // Only GET is allowed for all API routes.
+    if req.method() != Method::GET {
+        return api::json_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            r#"{"error":"Only GET is allowed"}"#,
+        );
+    }
+
+    // OpenAPI spec — publicly accessible, no auth needed.
+    if path == "/api/openapi.json" {
+        return api::openapi_spec();
+    }
+
+    // All other /api/ endpoints require API_KEY to be configured.
+    let expected_key = match api_key {
+        Some(key) => key,
+        None => {
+            return api::json_response(
+                StatusCode::NOT_FOUND,
+                r#"{"error":"API not enabled (API_KEY env var not set)"}"#,
+            );
+        }
+    };
+
+    // Validate Bearer token.
+    let auth_ok = req
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|token| token == expected_key)
+        .unwrap_or(false);
+
+    if !auth_ok {
+        return api::unauthorized_response();
+    }
+
+    // Dispatch to the matching handler.
+    if path == "/api/sessions" {
+        api::list_sessions(rotator)
+    } else if let Some(username) = path.strip_prefix("/api/sessions/") {
+        api::get_session(rotator, username)
+    } else {
+        api::json_response(StatusCode::NOT_FOUND, r#"{"error":"Not found"}"#)
+    }
 }
 
 // ---------------------------------------------------------------------------

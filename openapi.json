@@ -1,0 +1,172 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Proxy Rotator API",
+    "description": "API for inspecting active proxy sessions in proxy-rotator.\n\nAuthenticate with `Authorization: Bearer <api_key>` where `api_key` is set via the `API_KEY` environment variable.",
+    "license": {
+      "name": ""
+    },
+    "version": "0.4.0"
+  },
+  "paths": {
+    "/api/sessions": {
+      "get": {
+        "tags": [],
+        "summary": "List all active sessions",
+        "description": "Returns all currently active sticky sessions across all proxy sets.\nSessions with 0 minutes (no affinity) are not tracked and won't appear here.",
+        "operationId": "list_sessions",
+        "responses": {
+          "200": {
+            "description": "List of active sessions",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/SessionInfo"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid or missing API key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/api/sessions/{username}": {
+      "get": {
+        "tags": [],
+        "summary": "Get session by username",
+        "description": "Returns details of a specific active session identified by its full username\nin the format `<proxyset>-<minutes>-<sessionkey>`.",
+        "operationId": "get_session",
+        "parameters": [
+          {
+            "name": "username",
+            "in": "path",
+            "description": "Full username in format <proxyset>-<minutes>-<sessionkey>",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "residential-5-abc123"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Session found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionInfo"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid or missing API key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No active session for this username",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ApiError": {
+        "type": "object",
+        "description": "Error response body.",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "string",
+            "description": "Error message.",
+            "example": "No active session for 'residential-5-unknown'"
+          }
+        }
+      },
+      "SessionInfo": {
+        "type": "object",
+        "description": "Info about an active session, returned by the API.",
+        "required": [
+          "username",
+          "proxy_set",
+          "upstream",
+          "start_date",
+          "end_date"
+        ],
+        "properties": {
+          "end_date": {
+            "type": "string",
+            "description": "Session end time (ISO 8601 UTC).",
+            "example": "2026-02-23T21:05:00Z"
+          },
+          "proxy_set": {
+            "type": "string",
+            "description": "The proxy set name.",
+            "example": "residential"
+          },
+          "start_date": {
+            "type": "string",
+            "description": "Session start time (ISO 8601 UTC).",
+            "example": "2026-02-23T21:00:00Z"
+          },
+          "upstream": {
+            "type": "string",
+            "description": "The upstream proxy address (host:port).",
+            "example": "198.51.100.1:6658"
+          },
+          "username": {
+            "type": "string",
+            "description": "The full username: `<proxyset>-<minutes>-<sessionkey>`",
+            "example": "residential-5-abc123"
+          }
+        }
+      }
+    },
+    "securitySchemes": {
+      "bearer": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "API Key",
+        "description": "API key set via the API_KEY environment variable. Pass as: Authorization: Bearer <api_key>"
+      }
+    }
+  }
+}

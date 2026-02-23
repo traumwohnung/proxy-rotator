@@ -1,12 +1,9 @@
-mod config;
-mod proxy;
-mod rotator;
-mod tunnel;
-
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
+
+use proxy_rotator::{config, env, proxy, rotator};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -39,5 +36,5 @@ async fn main() -> Result<()> {
     rotator::spawn_affinity_cleanup(Arc::clone(&rotator));
 
     // Run the proxy server.
-    proxy::run_proxy(&cfg.bind_addr, rotator).await
+    proxy::run_proxy(&cfg.bind_addr, rotator, env::api_key()).await
 }

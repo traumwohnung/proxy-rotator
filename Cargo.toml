@@ -1,7 +1,19 @@
 [package]
 name = "proxy-rotator"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
+
+[lib]
+name = "proxy_rotator"
+path = "src/lib.rs"
+
+[[bin]]
+name = "proxy-rotator"
+path = "src/main.rs"
+
+[[bin]]
+name = "gen-openapi"
+path = "src/bin/gen_openapi.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -17,6 +29,8 @@ http = "1"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 dashmap = "6"
+serde_json = "1"
+utoipa = { version = "5", features = ["openapi_extensions"] }
 
 [dev-dependencies]
 tempfile = "3.25.0"

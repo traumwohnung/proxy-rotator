@@ -3,7 +3,7 @@ use crate::config::{ProxySet, UpstreamProxy};
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 /// A proxy rotator that manages multiple proxy sets.
 /// Each set picks the least-used proxy (with random tie-breaking)
@@ -29,6 +29,7 @@ struct ProxyEntry {
 struct AffinityEntry {
     proxy_index: usize,
     assigned_at: Instant,
+    assigned_at_wall: SystemTime,
     duration: Duration,
 }
 
@@ -39,6 +40,34 @@ pub struct ResolvedProxy {
     pub port: u16,
     pub username: Option<String>,
     pub password: Option<String>,
+}
+
+/// Info about an active session, returned by the API.
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+pub struct SessionInfo {
+    /// The full username: `<proxyset>-<minutes>-<sessionkey>`
+    #[schema(example = "residential-5-abc123")]
+    pub username: String,
+    /// The proxy set name.
+    #[schema(example = "residential")]
+    pub proxy_set: String,
+    /// The upstream proxy address (host:port).
+    #[schema(example = "198.51.100.1:6658")]
+    pub upstream: String,
+    /// Session start time (ISO 8601 UTC).
+    #[schema(example = "2026-02-23T21:00:00Z")]
+    pub start_date: String,
+    /// Session end time (ISO 8601 UTC).
+    #[schema(example = "2026-02-23T21:05:00Z")]
+    pub end_date: String,
+}
+
+/// Error response body.
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+pub struct ApiError {
+    /// Error message.
+    #[schema(example = "No active session for 'residential-5-unknown'")]
+    pub error: String,
 }
 
 impl Rotator {
@@ -96,6 +125,79 @@ impl Rotator {
             .find(|s| s.name == name)
             .map(|s| s.proxies.len())
     }
+
+    /// Get session info for a specific username (<proxyset>-<minutes>-<sessionkey>).
+    /// Returns None if the username format is invalid, the set doesn't exist,
+    /// or there's no active (non-expired) session.
+    pub fn get_session(&self, username: &str) -> Option<SessionInfo> {
+        let parts: Vec<&str> = username.splitn(3, '-').collect();
+        if parts.len() != 3 {
+            return None;
+        }
+        let set_name = parts[0];
+        let minutes_str = parts[1];
+        let session_key = parts[2];
+        let minutes: u16 = minutes_str.parse().ok()?;
+
+        let set = self.sets.iter().find(|s| s.name == set_name)?;
+        let affinity_key = format!("{}:{}", minutes, session_key);
+        let entry = set.affinity_map.get(&affinity_key)?;
+
+        // Check if still active.
+        if entry.assigned_at.elapsed() >= entry.duration {
+            return None;
+        }
+
+        let proxy = &set.proxies[entry.proxy_index].proxy;
+        let start = entry.assigned_at_wall;
+        let end = start + entry.duration;
+
+        Some(SessionInfo {
+            username: username.to_string(),
+            proxy_set: set_name.to_string(),
+            upstream: format!("{}:{}", proxy.host, proxy.port),
+            start_date: format_system_time(start),
+            end_date: format_system_time(end),
+        })
+    }
+
+    /// List all active (non-expired) sessions across all proxy sets.
+    pub fn list_sessions(&self) -> Vec<SessionInfo> {
+        let mut sessions = Vec::new();
+        for set in &self.sets {
+            for entry_ref in set.affinity_map.iter() {
+                let affinity_key = entry_ref.key();
+                let entry = entry_ref.value();
+
+                // Skip expired entries.
+                if entry.assigned_at.elapsed() >= entry.duration {
+                    continue;
+                }
+
+                // Parse affinity_key back: "<minutes>:<sessionkey>"
+                let colon_pos = match affinity_key.find(':') {
+                    Some(p) => p,
+                    None => continue,
+                };
+                let minutes_str = &affinity_key[..colon_pos];
+                let session_key = &affinity_key[colon_pos + 1..];
+                let username = format!("{}-{}-{}", set.name, minutes_str, session_key);
+
+                let proxy = &set.proxies[entry.proxy_index].proxy;
+                let start = entry.assigned_at_wall;
+                let end = start + entry.duration;
+
+                sessions.push(SessionInfo {
+                    username,
+                    proxy_set: set.name.clone(),
+                    upstream: format!("{}:{}", proxy.host, proxy.port),
+                    start_date: format_system_time(start),
+                    end_date: format_system_time(end),
+                });
+            }
+        }
+        sessions
+    }
 }
 
 impl RotatorSet {
@@ -125,6 +227,7 @@ impl RotatorSet {
             AffinityEntry {
                 proxy_index: idx,
                 assigned_at: Instant::now(),
+                assigned_at_wall: SystemTime::now(),
                 duration,
             },
         );
@@ -159,6 +262,44 @@ impl RotatorSet {
         self.proxies[idx].use_count.fetch_add(1, Ordering::Relaxed);
         idx
     }
+}
+
+/// Format a SystemTime as ISO 8601 (UTC) without external crate.
+fn format_system_time(t: SystemTime) -> String {
+    let dur = t
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = dur.as_secs();
+
+    // Manual UTC breakdown.
+    let days = secs / 86400;
+    let time_of_day = secs % 86400;
+    let hours = time_of_day / 3600;
+    let minutes = (time_of_day % 3600) / 60;
+    let seconds = time_of_day % 60;
+
+    // Days since 1970-01-01 → year/month/day.
+    let (year, month, day) = days_to_ymd(days as i64);
+
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        year, month, day, hours, minutes, seconds
+    )
+}
+
+fn days_to_ymd(mut days: i64) -> (i64, u32, u32) {
+    // Algorithm from http://howardhinnant.github.io/date_algorithms.html
+    days += 719468;
+    let era = if days >= 0 { days } else { days - 146096 } / 146097;
+    let doe = (days - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
 }
 
 /// Fast, good-enough random using thread-local xorshift64.
@@ -322,5 +463,67 @@ mod tests {
             "Expected varied random output, got {} unique values",
             vals.len()
         );
+    }
+
+    #[test]
+    fn test_get_session_active() {
+        let rotator = Rotator::new(vec![make_test_set(4)]);
+
+        // Create a session with affinity.
+        let p = rotator.next_proxy("test", 5, "mysess").unwrap();
+
+        // Query it.
+        let info = rotator.get_session("test-5-mysess").unwrap();
+        assert_eq!(info.proxy_set, "test");
+        assert_eq!(info.username, "test-5-mysess");
+        assert_eq!(info.upstream, format!("{}:{}", p.host, p.port));
+        assert!(!info.start_date.is_empty());
+        assert!(!info.end_date.is_empty());
+    }
+
+    #[test]
+    fn test_get_session_no_affinity_returns_none() {
+        let rotator = Rotator::new(vec![make_test_set(4)]);
+
+        // 0 minutes = no affinity → no session stored.
+        rotator.next_proxy("test", 0, "nosess").unwrap();
+        assert!(rotator.get_session("test-0-nosess").is_none());
+    }
+
+    #[test]
+    fn test_get_session_unknown_returns_none() {
+        let rotator = Rotator::new(vec![make_test_set(4)]);
+        assert!(rotator.get_session("test-5-nonexistent").is_none());
+        assert!(rotator.get_session("badformat").is_none());
+    }
+
+    #[test]
+    fn test_list_sessions() {
+        let rotator = Rotator::new(vec![make_test_set(4)]);
+
+        // Create a few sessions.
+        rotator.next_proxy("test", 5, "sessA").unwrap();
+        rotator.next_proxy("test", 10, "sessB").unwrap();
+        rotator.next_proxy("test", 0, "noaff").unwrap(); // won't appear
+
+        let sessions = rotator.list_sessions();
+        assert_eq!(sessions.len(), 2);
+
+        let usernames: Vec<&str> = sessions.iter().map(|s| s.username.as_str()).collect();
+        assert!(usernames.contains(&"test-5-sessA"));
+        assert!(usernames.contains(&"test-10-sessB"));
+    }
+
+    #[test]
+    fn test_format_system_time_epoch() {
+        let epoch = SystemTime::UNIX_EPOCH;
+        assert_eq!(format_system_time(epoch), "1970-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn test_format_system_time_known_date() {
+        // 2025-06-15T15:10:45Z = 1750000245 seconds since epoch
+        let t = SystemTime::UNIX_EPOCH + Duration::from_secs(1750000245);
+        assert_eq!(format_system_time(t), "2025-06-15T15:10:45Z");
     }
 }

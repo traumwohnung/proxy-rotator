@@ -1,6 +1,6 @@
 # proxy-rotator
 
-A Rust HTTP proxy server that load-balances requests across pools of upstream proxies with least-used rotation and per-request session affinity.
+A Rust HTTP proxy server that load-balances requests across pools of upstream proxies with least-used rotation, per-request session affinity, and a REST API for session inspection.
 
 ## Architecture
 
@@ -13,6 +13,7 @@ Client ──HTTP/CONNECT──→ proxy-rotator ──→ upstream proxy pool �
 - **Least-used rotation** — requests go to the proxy with the lowest use count, with random tie-breaking among equally-used proxies.
 - **Per-request session affinity** — controlled via the username, pin a session key to the same upstream proxy for a specified duration (0–1440 minutes).
 - **Per-proxy credentials** — each proxy entry includes its own username:password.
+- **REST API** — inspect active sessions and their assigned upstream proxies.
 
 ## Configuration
 
@@ -42,6 +43,13 @@ One proxy per line. Format: `host:port:username:password` or `host:port` (no aut
 198.51.100.3:5432:exampleuser:examplepass
 ```
 
+### Environment variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `RUST_LOG` | Log level (overrides config) | from config |
+| `API_KEY` | Bearer token for the `/api/sessions` endpoints. If unset, session API endpoints are disabled. | _(disabled)_ |
+
 ## Usage
 
 ```bash
@@ -53,6 +61,9 @@ cargo build --release
 
 # Or specify a config file
 ./target/release/proxy-rotator /path/to/config.toml
+
+# Run with API enabled
+API_KEY=mysecretkey ./target/release/proxy-rotator
 ```
 
 ### Client usage
@@ -98,11 +109,73 @@ curl -x http://127.0.0.1:8100 \
   https://httpbin.org/ip
 ```
 
-### Environment variables
+## REST API
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `RUST_LOG` | Log level (overrides config) | from config |
+The API allows inspecting active sticky sessions. All session endpoints require the `API_KEY` environment variable to be set and a matching `Authorization: Bearer <key>` header.
+
+The OpenAPI spec is available at `/api/openapi.json` (no auth required).
+
+### Endpoints
+
+#### `GET /api/openapi.json`
+
+Returns the OpenAPI 3.1 specification. **No authentication required.**
+
+```bash
+curl http://127.0.0.1:8100/api/openapi.json
+```
+
+#### `GET /api/sessions`
+
+List all active sticky sessions across all proxy sets.
+
+```bash
+curl -H "Authorization: Bearer mysecretkey" \
+  http://127.0.0.1:8100/api/sessions
+```
+
+Response:
+```json
+[
+  {
+    "username": "residential-5-abc123",
+    "proxy_set": "residential",
+    "upstream": "198.51.100.1:6658",
+    "start_date": "2026-02-23T21:00:00Z",
+    "end_date": "2026-02-23T21:05:00Z"
+  }
+]
+```
+
+#### `GET /api/sessions/{username}`
+
+Get details of a specific active session by its full username.
+
+```bash
+curl -H "Authorization: Bearer mysecretkey" \
+  http://127.0.0.1:8100/api/sessions/residential-5-abc123
+```
+
+Response:
+```json
+{
+  "username": "residential-5-abc123",
+  "proxy_set": "residential",
+  "upstream": "198.51.100.1:6658",
+  "start_date": "2026-02-23T21:00:00Z",
+  "end_date": "2026-02-23T21:05:00Z"
+}
+```
+
+Returns `404` if the session doesn't exist or has expired. Sessions with `minutes=0` are never tracked.
+
+### OpenAPI spec generation
+
+The `openapi.json` file can be regenerated with:
+
+```bash
+cargo run --bin gen-openapi
+```
 
 ## How It Works
 
@@ -134,6 +207,7 @@ When `minutes = 0`, every request goes through pure least-used rotation with no 
 ```bash
 docker build -t proxy-rotator .
 docker run -p 8100:8100 \
+  -e API_KEY=mysecretkey \
   -v ./config.toml:/data/config/config.toml:ro \
   -v ./proxies:/data/config/proxies:ro \
   proxy-rotator
