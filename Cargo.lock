@@ -480,7 +480,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-rotator"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "base64",
