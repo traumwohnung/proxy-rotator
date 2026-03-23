@@ -19,7 +19,8 @@ Client ──HTTP/CONNECT──→ proxy-rotator ──→ upstream proxy pool �
 ```
 
 - **No TLS termination** — raw bytes are relayed through CONNECT tunnels. The client's own TLS handshake reaches the destination untouched.
-- Multiple **proxy sets** — each with its own pool of upstream proxies and rotation strategy.
+- **Pluggable proxy sources** — each proxy set declares a `source_type` that controls how upstream endpoints are obtained. Currently supported: `static_file` (load from a text file). The source abstraction makes it straightforward to add API-based, algorithmically-generated, or other source types in the future.
+- Multiple **proxy sets** — each with its own source and rotation strategy.
 - **Least-used rotation** — requests go to the proxy with the lowest use count, with random tie-breaking among equally-used proxies.
 - **Session affinity** — pin a session to the same upstream proxy for a configurable duration (0–1440 minutes), encoded in the username.
 - **Per-proxy credentials** — each proxy entry includes its own username:password.
@@ -27,7 +28,9 @@ Client ──HTTP/CONNECT──→ proxy-rotator ──→ upstream proxy pool �
 
 ## Configuration
 
-All configuration lives in a TOML file (default: `config.toml`):
+All configuration lives in a TOML file (default: `config.toml`).
+
+Each `[[proxy_set]]` has a `name`, a `source_type` that selects the proxy source implementation, and a `[proxy_set.source]` table with the source-specific parameters:
 
 ```toml
 bind_addr = "127.0.0.1:8100"
@@ -35,14 +38,28 @@ log_level = "info"
 
 [[proxy_set]]
 name = "residential"
+source_type = "static_file"
+
+[proxy_set.source]
 proxies_file = "proxies/residential.txt"
 
 [[proxy_set]]
 name = "datacenter"
+source_type = "static_file"
+
+[proxy_set.source]
 proxies_file = "proxies/datacenter.txt"
 ```
 
-### Proxy list files
+### Source types
+
+#### `static_file`
+
+Loads proxies from a plain-text file at startup.
+
+| Source parameter | Description |
+|------------------|-------------|
+| `proxies_file` | Path to the proxy list file (relative to config file directory) |
 
 One proxy per line. Format: `host:port:username:password` or `host:port` (no auth). Comments (`#`) and blank lines are ignored:
 
@@ -214,12 +231,22 @@ proxyUrl.password = "x";
 
 1. Client sends an HTTP request or CONNECT tunnel with `Proxy-Authorization: Basic <base64>`
 2. The base64 string is decoded and parsed to extract `set`, `minutes`, and `meta`
-3. An upstream proxy is chosen via **least-used rotation** (lowest use count, random tie-breaking)
+3. The proxy set's source is asked for an upstream endpoint (e.g. `static_file` uses least-used rotation)
 4. If `minutes > 0`, the base64 string is used as the affinity key — the same username always maps to the same proxy until the session expires
-5. Upstream credentials from the proxy list are forwarded to the upstream
+5. Upstream credentials from the proxy entry are forwarded to the upstream
 6. **CONNECT**: a tunnel is established and bytes are relayed bidirectionally — no TLS termination
 7. **Plain HTTP**: request is forwarded through the upstream with the absolute URI
 8. Expired affinity entries are cleaned up every 60 seconds
+
+## Adding a new source type
+
+The proxy source abstraction (`ProxySource` trait in `source.rs`) makes it easy to add new ways of obtaining upstream endpoints:
+
+1. Add a config struct and a new variant to `ProxySourceConfig` in `source.rs`
+2. Create a struct that implements the `ProxySource` trait (`request_endpoint`, `describe`, `len`)
+3. Add a match arm in `ProxySourceConfig::from_type_and_table` and `build_source`
+
+The rotator, API, and all routing code are source-agnostic — no changes needed there.
 
 ## Docker
 

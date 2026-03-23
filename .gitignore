@@ -10,3 +10,7 @@ bun.lockb
 # Local config
 config.toml
 proxies/
+
+# IDE / OS
+.DS_Store
+.pi/

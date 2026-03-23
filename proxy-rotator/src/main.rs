@@ -29,7 +29,7 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| std::path::Path::new("."));
 
     // Load all proxy sets.
-    let proxy_sets = config::load_proxy_sets(&cfg, config_dir)?;
+    let proxy_sets = config::build_proxy_sets(&cfg, config_dir)?;
     let rotator = Arc::new(rotator::Rotator::new(proxy_sets));
 
     // Start affinity cleanup task.

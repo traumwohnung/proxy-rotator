@@ -16,8 +16,14 @@ log_level = "info"
 
 [[proxy_set]]
 name = "residential"
+source_type = "static_file"
+
+[proxy_set.source]
 proxies_file = "residential.txt"
 
 [[proxy_set]]
 name = "datacenter"
+source_type = "static_file"
+
+[proxy_set.source]
 proxies_file = "datacenter.txt"

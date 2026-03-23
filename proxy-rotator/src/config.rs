@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+use crate::source::{build_source, ProxySource, ProxySourceConfig};
 
 /// Top-level configuration file (TOML).
 #[derive(Debug, Deserialize)]
@@ -21,14 +23,30 @@ pub struct Config {
 }
 
 /// Configuration for a single proxy set.
+///
+/// The `source_type` field selects the source kind; the `source` table carries
+/// the source-specific parameters (different fields per type).
+///
+/// ```toml
+/// [[proxy_set]]
+/// name = "residential"
+/// source_type = "static_file"
+///
+/// [proxy_set.source]
+/// proxies_file = "residential.txt"
+/// ```
 #[derive(Debug, Deserialize)]
 pub struct ProxySetConfig {
     /// Name of this proxy set (used as the proxy username to select it).
     pub name: String,
 
-    /// Path to the proxies file (one proxy per line).
-    /// Format: host:port:username:password  or  host:port
-    pub proxies_file: PathBuf,
+    /// Source type discriminant (e.g. `"static_file"`).
+    pub source_type: String,
+
+    /// Source-specific configuration table. The expected keys depend on
+    /// `source_type`.
+    #[serde(default)]
+    pub source: toml::Table,
 }
 
 fn default_bind_addr() -> String {
@@ -48,11 +66,24 @@ pub struct UpstreamProxy {
     pub password: Option<String>,
 }
 
-/// A fully-loaded proxy set ready for use.
-#[derive(Debug)]
+/// A fully-initialised proxy set ready for use by the [`crate::rotator::Rotator`].
+///
+/// The `source` field is a type-erased [`ProxySource`] that the rotator calls
+/// on every request to obtain the next upstream endpoint. All source-specific
+/// logic (file I/O, API calls, address generation) is encapsulated inside the
+/// source implementation.
 pub struct ProxySet {
     pub name: String,
-    pub proxies: Vec<UpstreamProxy>,
+    pub source: Box<dyn ProxySource>,
+}
+
+impl std::fmt::Debug for ProxySet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxySet")
+            .field("name", &self.name)
+            .field("source", &self.source.describe())
+            .finish()
+    }
 }
 
 impl Config {
@@ -99,7 +130,6 @@ pub fn load_proxies(path: &Path) -> Result<Vec<UpstreamProxy>> {
 ///   [ipv6]:port:username:password
 ///   [ipv6]:port
 fn parse_proxy_line(s: &str) -> Result<UpstreamProxy> {
-    // Handle IPv6 [host]:port...
     if s.starts_with('[') {
         let bracket_end = s
             .find(']')
@@ -112,7 +142,6 @@ fn parse_proxy_line(s: &str) -> Result<UpstreamProxy> {
         return parse_port_and_creds(&host, rest);
     }
 
-    // Split into parts by ':'
     let parts: Vec<&str> = s.splitn(4, ':').collect();
     match parts.len() {
         2 => {
@@ -162,37 +191,54 @@ fn parse_port_and_creds(host: &str, rest: &str) -> Result<UpstreamProxy> {
     }
 }
 
-/// Load all proxy sets from config.
-pub fn load_proxy_sets(config: &Config, config_dir: &Path) -> Result<Vec<ProxySet>> {
+/// Build all proxy sets from config by constructing the appropriate source for
+/// each set.
+///
+/// `config_dir` is the directory that contains the config file; it is used to
+/// resolve relative paths inside source configurations.
+pub fn build_proxy_sets(config: &Config, config_dir: &Path) -> Result<Vec<ProxySet>> {
     let mut sets = Vec::new();
     for ps in &config.proxy_sets {
-        let proxies_path = if ps.proxies_file.is_relative() {
-            config_dir.join(&ps.proxies_file)
-        } else {
-            ps.proxies_file.clone()
-        };
-        let proxies = load_proxies(&proxies_path)?;
-        if proxies.is_empty() {
-            anyhow::bail!(
-                "proxy set '{}': no proxies found in {}",
-                ps.name,
-                proxies_path.display()
-            );
-        }
-        let with_creds = proxies.iter().filter(|p| p.username.is_some()).count();
+        let source_config = ProxySourceConfig::from_type_and_table(&ps.source_type, &ps.source)
+            .with_context(|| {
+                format!(
+                    "parsing source config for proxy set '{}' (type '{}')",
+                    ps.name, ps.source_type
+                )
+            })?;
+        let source = build_source(&source_config, config_dir)
+            .with_context(|| format!("initialising source for proxy set '{}'", ps.name))?;
+
+        let endpoint_count = source
+            .len()
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "dynamic".to_string());
         tracing::info!(
-            "Loaded proxy set '{}': {} proxies ({} with credentials) from {}",
+            "Loaded proxy set '{}': {} ({}  endpoints)",
             ps.name,
-            proxies.len(),
-            with_creds,
-            proxies_path.display()
+            source.describe(),
+            endpoint_count,
         );
+
         sets.push(ProxySet {
             name: ps.name.clone(),
-            proxies,
+            source,
         });
     }
     Ok(sets)
+}
+
+// ---------------------------------------------------------------------------
+// Backward-compat alias so callers that used `load_proxy_sets` still compile.
+// ---------------------------------------------------------------------------
+
+/// Deprecated alias for [`build_proxy_sets`].
+///
+/// Kept for a single transition step; will be removed in the next cleanup.
+#[deprecated(since = "0.8.0", note = "use `build_proxy_sets` instead")]
+#[allow(dead_code)]
+pub fn load_proxy_sets(config: &Config, config_dir: &Path) -> Result<Vec<ProxySet>> {
+    build_proxy_sets(config, config_dir)
 }
 
 #[cfg(test)]
