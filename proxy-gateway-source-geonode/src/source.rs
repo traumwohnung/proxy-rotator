@@ -1,14 +1,13 @@
 use anyhow::Context;
-use proxy_gateway_core::{cheap_random, AffinityParams, ProxySource, SourceProxy};
+use proxy_gateway_core::{AffinityParams, ProxySource, SourceProxy};
 
-use crate::api::fetch_proxies;
 use crate::config::GeonodeConfig;
+use crate::username::{build_username, rotate_username};
 
 #[derive(Debug)]
 pub struct GeonodeSource {
     config: GeonodeConfig,
     password: String,
-    client: reqwest::Client,
 }
 
 impl GeonodeSource {
@@ -19,56 +18,39 @@ impl GeonodeSource {
                 cfg.password_env
             )
         })?;
+        Ok(Self { config: cfg.clone(), password })
+    }
 
-        let client = reqwest::Client::new();
-
-        Ok(Self {
-            config: cfg.clone(),
-            password,
-            client,
-        })
+    fn make_proxy(&self, username: String) -> SourceProxy {
+        SourceProxy {
+            host: self.config.host.clone(),
+            port: self.config.port,
+            username: Some(username),
+            password: Some(self.password.clone()),
+        }
     }
 }
 
 #[async_trait::async_trait]
 impl ProxySource for GeonodeSource {
     async fn get_source_proxy(&self, _affinity_params: &AffinityParams) -> Option<SourceProxy> {
-        let proxies = match fetch_proxies(&self.client, &self.config, &self.password).await {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::error!("geonode API call failed: {e:#}");
-                return None;
-            }
-        };
+        Some(self.make_proxy(build_username(&self.config)))
+    }
 
-        let idx = cheap_random() as usize % proxies.len();
-        let proxy = &proxies[idx];
-
-        let port: u16 = match proxy.port.parse() {
-            Ok(p) => p,
-            Err(_) => {
-                tracing::error!("geonode API returned invalid port '{}'", proxy.port);
-                return None;
-            }
-        };
-
-        Some(SourceProxy {
-            host: proxy.host.clone(),
-            port,
-            username: Some(self.config.username.clone()),
-            password: Some(self.password.clone()),
-        })
+    async fn get_source_proxy_force_rotate(
+        &self,
+        _affinity_params: &AffinityParams,
+        _current: &SourceProxy,
+    ) -> Option<SourceProxy> {
+        Some(self.make_proxy(rotate_username(&self.config)))
     }
 
     fn describe(&self) -> String {
         let mut parts = vec!["geonode".to_string()];
-        if let Some(ref t) = self.config.proxy_type {
-            parts.push(t.clone());
+        if !self.config.countries.is_empty() {
+            parts.push(self.config.countries.join(","));
         }
-        if let Some(ref c) = self.config.country {
-            parts.push(c.clone());
-        }
-        parts.push(format!("{}@api.geonode.com", self.config.username));
+        parts.push(format!("{}@{}:{}", self.config.username, self.config.host, self.config.port));
         parts.join(" ")
     }
 }
@@ -76,4 +58,80 @@ impl ProxySource for GeonodeSource {
 /// Construct a [`GeonodeSource`] from config.
 pub fn build_source(config: &GeonodeConfig) -> anyhow::Result<Box<dyn ProxySource>> {
     Ok(Box::new(GeonodeSource::from_config(config)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{SessionConfig, StickyConfig};
+
+    fn make_source(session: SessionConfig, countries: Vec<&str>) -> GeonodeSource {
+        std::env::set_var("TEST_GN_PASS", "testpassword");
+        GeonodeSource::from_config(&GeonodeConfig {
+            username: "geonode-exampleuser".to_string(),
+            password_env: "TEST_GN_PASS".to_string(),
+            host: "premium-residential.geonode.com".to_string(),
+            port: 9000,
+            countries: countries.into_iter().map(str::to_string).collect(),
+            session,
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_rotating_proxy_fields() {
+        let source = make_source(SessionConfig::Rotating, vec![]);
+        let proxy = source.get_source_proxy(&AffinityParams::new()).await.unwrap();
+        assert_eq!(proxy.host, "premium-residential.geonode.com");
+        assert_eq!(proxy.port, 9000);
+        assert_eq!(proxy.password.as_deref(), Some("testpassword"));
+        assert_eq!(proxy.username.as_deref(), Some("geonode-exampleuser"));
+    }
+
+    #[tokio::test]
+    async fn test_rotating_with_country() {
+        let source = make_source(SessionConfig::Rotating, vec!["US"]);
+        let proxy = source.get_source_proxy(&AffinityParams::new()).await.unwrap();
+        assert_eq!(proxy.username.as_deref(), Some("geonode-exampleuser-country-US"));
+    }
+
+    #[tokio::test]
+    async fn test_sticky_username_contains_session() {
+        let source = make_source(SessionConfig::Sticky(StickyConfig { sess_time: 10 }), vec![]);
+        let proxy = source.get_source_proxy(&AffinityParams::new()).await.unwrap();
+        let u = proxy.username.unwrap();
+        assert!(u.contains("-session-"));
+        assert!(u.contains("-sessTime-10"));
+    }
+
+    #[tokio::test]
+    async fn test_force_rotate_changes_session_id() {
+        let source = make_source(SessionConfig::Sticky(StickyConfig { sess_time: 10 }), vec![]);
+        let original = source.get_source_proxy(&AffinityParams::new()).await.unwrap();
+        let rotated = source.get_source_proxy_force_rotate(&AffinityParams::new(), &original).await.unwrap();
+        assert_ne!(original.username, rotated.username);
+    }
+
+    #[tokio::test]
+    async fn test_describe() {
+        let source = make_source(SessionConfig::Rotating, vec!["US", "DE"]);
+        assert_eq!(
+            source.describe(),
+            "geonode US,DE geonode-exampleuser@premium-residential.geonode.com:9000"
+        );
+    }
+
+    #[test]
+    fn test_missing_env_var_fails() {
+        std::env::remove_var("NONEXISTENT_GN_VAR");
+        let cfg = GeonodeConfig {
+            username: "user".to_string(),
+            password_env: "NONEXISTENT_GN_VAR".to_string(),
+            host: "premium-residential.geonode.com".to_string(),
+            port: 9000,
+            countries: vec![],
+            session: SessionConfig::Rotating,
+        };
+        assert!(GeonodeSource::from_config(&cfg).is_err());
+    }
 }
