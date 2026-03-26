@@ -93,13 +93,25 @@ where
     debug!("Sending CONNECT to upstream:\n{req}");
     stream.write_all(req.as_bytes()).await?;
 
-    // Read the response — we expect "HTTP/1.x 200".
-    let mut buf = vec![0u8; 4096];
-    let n = stream.read(&mut buf).await?;
-    if n == 0 {
-        anyhow::bail!("Upstream proxy closed connection without response");
+    // Read until the full HTTP response is received (ends with \r\n\r\n).
+    // Some upstream proxies (e.g. Bottingtools residential) send the status
+    // line and headers in separate TCP packets. A single read() would only
+    // get the first packet and miss the terminal \r\n\r\n, causing the
+    // leftover bytes to corrupt the subsequent TLS handshake.
+    let mut buf = Vec::with_capacity(4096);
+    let mut tmp = [0u8; 1024];
+    loop {
+        let n = stream.read(&mut tmp).await?;
+        if n == 0 {
+            anyhow::bail!("Upstream proxy closed connection without response");
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
     }
-    let resp = String::from_utf8_lossy(&buf[..n]);
+
+    let resp = String::from_utf8_lossy(&buf);
     debug!("Upstream CONNECT response: {resp}");
 
     if !resp.starts_with("HTTP/1.1 200") && !resp.starts_with("HTTP/1.0 200") {
