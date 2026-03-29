@@ -75,12 +75,31 @@ func (m Meta) GetString(key string) string {
 	return v
 }
 
+// Protocol is the proxy protocol used to connect to the upstream.
+type Protocol string
+
+const (
+	ProtocolHTTP   Protocol = "http"
+	ProtocolSOCKS5 Protocol = "socks5"
+)
+
 // Proxy is a resolved upstream proxy endpoint.
 type Proxy struct {
 	Host     string
 	Port     uint16
 	Username string
 	Password string
+	// Protocol determines how to connect through this upstream proxy.
+	// Defaults to ProtocolHTTP if empty.
+	Protocol Protocol
+}
+
+// GetProtocol returns the protocol, defaulting to HTTP if empty.
+func (p *Proxy) GetProtocol() Protocol {
+	if p.Protocol == "" {
+		return ProtocolHTTP
+	}
+	return p.Protocol
 }
 
 // ConnHandle tracks a single active proxied connection for traffic accounting

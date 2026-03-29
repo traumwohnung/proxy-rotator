@@ -1,40 +1,33 @@
-// Package gateway provides an HTTP proxy server (CONNECT + plain HTTP)
-// that delegates proxy resolution to a core.Handler pipeline.
+// Package gateway provides HTTP and SOCKS5 proxy servers that delegate
+// proxy resolution to a core.Handler pipeline.
 //
-// Usage:
-//
-//	pipeline := middleware.Auth(myAuth,
-//	    middleware.Sticky(sources.StaticFile("proxies.txt")),
-//	)
-//	gateway.Run(":8100", pipeline)
+// Downstream (client→gateway) supports both HTTP and SOCKS5 protocols.
+// Upstream (gateway→proxy) supports both HTTP CONNECT and SOCKS5, determined
+// by the Protocol field of the core.Proxy returned by the handler.
+// The two sides are independent — HTTP→SOCKS5 and SOCKS5→HTTP both work.
 package gateway
 
 import (
-	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/netip"
 	"strconv"
 	"strings"
-	"time"
 
 	"proxy-gateway/core"
 )
 
-// Run starts the HTTP proxy server and blocks.
+// Run starts an HTTP proxy server on addr and blocks.
 func Run(addr string, handler core.Handler) error {
-	slog.Info("proxy gateway listening", "addr", addr)
+	slog.Info("HTTP proxy gateway listening", "addr", addr)
 	return http.ListenAndServe(addr, HTTPHandler(handler))
 }
 
-// HTTPHandler returns an http.Handler that serves proxy requests.
-// It parses the Proxy-Authorization header to build a core.Request,
-// calls handler.Resolve, and tunnels through the returned Proxy.
+// HTTPHandler returns an http.Handler that serves HTTP proxy requests.
 func HTTPHandler(handler core.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		clientIP, _, _ := net.SplitHostPort(r.RemoteAddr)
@@ -62,12 +55,11 @@ func HTTPHandler(handler core.Handler) http.Handler {
 			"method", r.Method,
 			"uri", r.RequestURI,
 			"sub", req.Sub,
-			"set", req.Set,
 			"upstream", fmt.Sprintf("%s:%d", proxy.Host, proxy.Port),
+			"upstream_proto", proxy.GetProtocol(),
 			"client", clientIP,
 		)
 
-		// Check if the handler (or any wrapper) implements ConnectionTracker.
 		var handle core.ConnHandle
 		if tracker, ok := handler.(core.ConnectionTracker); ok {
 			handle, err = tracker.OpenConnection(req.Sub)
@@ -111,7 +103,6 @@ func parseBasicAuth(headerVal string) (*core.Request, error) {
 		return nil, fmt.Errorf("empty username in Proxy-Authorization")
 	}
 
-	// Parse the JSON username: {"sub":"...", "set":"...", "minutes":N, "meta":{...}}
 	var parsed struct {
 		Sub     string                 `json:"sub"`
 		Set     string                 `json:"set"`
@@ -133,13 +124,13 @@ func parseBasicAuth(headerVal string) (*core.Request, error) {
 		Password:   password,
 		Set:        parsed.Set,
 		Meta:       core.Meta(parsed.Meta),
-		SessionKey: b64, // stable key for affinity
+		SessionKey: b64,
 		SessionTTL: parsed.Minutes,
 	}, nil
 }
 
 // ---------------------------------------------------------------------------
-// CONNECT tunnel
+// HTTP CONNECT
 // ---------------------------------------------------------------------------
 
 func serveConnect(w http.ResponseWriter, r *http.Request, proxy *core.Proxy, handle core.ConnHandle) {
@@ -152,7 +143,7 @@ func serveConnect(w http.ResponseWriter, r *http.Request, proxy *core.Proxy, han
 		return
 	}
 	w.WriteHeader(http.StatusOK)
-	conn, _, err := hj.Hijack()
+	clientConn, _, err := hj.Hijack()
 	if err != nil {
 		slog.Error("hijack failed", "err", err)
 		if handle != nil {
@@ -160,99 +151,23 @@ func serveConnect(w http.ResponseWriter, r *http.Request, proxy *core.Proxy, han
 		}
 		return
 	}
-	defer conn.Close()
+	defer clientConn.Close()
 
-	sent, received, err := connectTunnel(conn, r.Host, proxy, handle)
-	if handle != nil {
-		handle.Close(sent, received)
-	}
+	// Dial upstream using the proxy's protocol (HTTP CONNECT or SOCKS5).
+	upstreamConn, err := dialUpstream(proxy, r.Host)
 	if err != nil {
-		slog.Debug("tunnel closed", "err", err)
-	}
-}
-
-func connectTunnel(clientConn net.Conn, target string, proxy *core.Proxy, handle core.ConnHandle) (sent, received int64, err error) {
-	upstreamAddr := hostPort(proxy.Host, proxy.Port)
-	upstreamConn, err := net.Dial("tcp", upstreamAddr)
-	if err != nil {
-		return 0, 0, fmt.Errorf("connecting to upstream %s: %w", upstreamAddr, err)
+		slog.Error("upstream dial failed", "err", err)
+		if handle != nil {
+			handle.Close(0, 0)
+		}
+		return
 	}
 	defer upstreamConn.Close()
 
-	// CONNECT handshake with upstream.
-	req := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n", target, target)
-	if proxy.Username != "" {
-		req += "Proxy-Authorization: Basic " + base64.StdEncoding.EncodeToString(
-			[]byte(proxy.Username+":"+proxy.Password)) + "\r\n"
-	}
-	req += "\r\n"
-	if _, err = fmt.Fprint(upstreamConn, req); err != nil {
-		return 0, 0, fmt.Errorf("sending CONNECT: %w", err)
-	}
-
-	// Read full CONNECT response (loop until \r\n\r\n).
-	var respBuf []byte
-	tmp := make([]byte, 1024)
-	for {
-		n, readErr := upstreamConn.Read(tmp)
-		if n > 0 {
-			respBuf = append(respBuf, tmp[:n]...)
-		}
-		if readErr != nil {
-			return 0, 0, fmt.Errorf("reading CONNECT response: %w", readErr)
-		}
-		for i := 0; i+3 < len(respBuf); i++ {
-			if respBuf[i] == '\r' && respBuf[i+1] == '\n' && respBuf[i+2] == '\r' && respBuf[i+3] == '\n' {
-				goto gotResponse
-			}
-		}
-	}
-gotResponse:
-	resp := string(respBuf)
-	if len(resp) < 12 || (resp[:12] != "HTTP/1.1 200" && resp[:12] != "HTTP/1.0 200") {
-		return 0, 0, fmt.Errorf("upstream rejected CONNECT: %s", resp)
-	}
-
-	// Cancellable relay with optional traffic counting.
-	_, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	cancelConn := func() {
-		cancel()
-		_ = clientConn.SetDeadline(immediateDeadline())
-		_ = upstreamConn.SetDeadline(immediateDeadline())
-	}
-
-	var clientReader io.Reader = clientConn
-	var upstreamReader io.Reader = upstreamConn
+	sent, received := relay(clientConn, upstreamConn, handle)
 	if handle != nil {
-		clientReader = &countingReader{r: clientConn, upstream: true, handle: handle, cancel: cancelConn}
-		upstreamReader = &countingReader{r: upstreamConn, upstream: false, handle: handle, cancel: cancelConn}
+		handle.Close(sent, received)
 	}
-
-	type result struct {
-		n   int64
-		err error
-	}
-	sentCh := make(chan result, 1)
-	recvCh := make(chan result, 1)
-	go func() {
-		n, err := io.Copy(upstreamConn, clientReader)
-		if tc, ok := upstreamConn.(*net.TCPConn); ok {
-			_ = tc.CloseWrite()
-		}
-		sentCh <- result{n, err}
-	}()
-	go func() {
-		n, err := io.Copy(clientConn, upstreamReader)
-		if tc, ok := clientConn.(*net.TCPConn); ok {
-			_ = tc.CloseWrite()
-		}
-		recvCh <- result{n, err}
-	}()
-
-	sr := <-sentCh
-	rr := <-recvCh
-	return sr.n, rr.n, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -297,21 +212,6 @@ func serveHTTP(w http.ResponseWriter, r *http.Request, proxy *core.Proxy, handle
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-type countingReader struct {
-	r        io.Reader
-	upstream bool
-	handle   core.ConnHandle
-	cancel   func()
-}
-
-func (cr *countingReader) Read(p []byte) (int, error) {
-	n, err := cr.r.Read(p)
-	if n > 0 {
-		cr.handle.RecordTraffic(cr.upstream, int64(n), cr.cancel)
-	}
-	return n, err
-}
 
 func writeRawResponse(w http.ResponseWriter, raw []byte) {
 	headerEnd := len(raw)
@@ -360,5 +260,3 @@ func isHopByHop(header string) bool {
 	}
 	return false
 }
-
-func immediateDeadline() time.Time { return time.Unix(0, 1) }

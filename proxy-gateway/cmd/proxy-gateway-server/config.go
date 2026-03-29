@@ -19,8 +19,9 @@ import (
 )
 
 type Config struct {
-	BindAddr     string        `toml:"bind_addr"      yaml:"bind_addr"      json:"bind_addr"`
-	LogLevel     string        `toml:"log_level"      yaml:"log_level"      json:"log_level"`
+	BindAddr     string        `toml:"bind_addr"       yaml:"bind_addr"       json:"bind_addr"`
+	Socks5Addr   string        `toml:"socks5_addr"     yaml:"socks5_addr"     json:"socks5_addr"`
+	LogLevel     string        `toml:"log_level"       yaml:"log_level"       json:"log_level"`
 	AuthSub      string        `toml:"auth_sub"       yaml:"auth_sub"       json:"auth_sub"`
 	AuthPassword string        `toml:"auth_password"  yaml:"auth_password"  json:"auth_password"`
 	ProxySets    []ProxySetRaw `toml:"proxy_set"      yaml:"proxy_set"      json:"proxy_set"`
