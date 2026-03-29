@@ -44,9 +44,9 @@ import (
 //
 //	ca := mitm.MustLoadCA("ca.crt", "ca.key")
 //	pipeline := middleware.ParseJSONCreds(
-//	    middleware.Auth(auth,
+//	    core.Auth(auth,
 //	        middleware.MITM(ca,
-//	            middleware.Sticky(source),
+//	            core.Sticky(source),
 //	        ),
 //	    ),
 //	)

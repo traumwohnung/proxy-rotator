@@ -9,10 +9,9 @@ import (
 
 	"proxy-gateway/core"
 	"proxy-gateway/gateway"
-	"proxy-gateway/middleware"
 )
 
-func RunServer(cfg *Config, pipeline core.Handler, sessions *middleware.StickyHandler, apiKey string) error {
+func RunServer(cfg *Config, pipeline core.Handler, sessions *core.StickyHandler, apiKey string) error {
 	r := chi.NewRouter()
 	r.Use(chiware.Recoverer)
 

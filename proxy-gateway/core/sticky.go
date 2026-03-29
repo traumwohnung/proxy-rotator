@@ -1,4 +1,4 @@
-package middleware
+package core
 
 import (
 	"context"
@@ -6,8 +6,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"proxy-gateway/core"
 )
 
 // SessionInfo describes an active sticky session (for API introspection).
@@ -18,17 +16,17 @@ type SessionInfo struct {
 	CreatedAt      time.Time `json:"created_at"`
 	NextRotationAt time.Time `json:"next_rotation_at"`
 	LastRotationAt time.Time `json:"last_rotation_at"`
-	Meta           core.Meta `json:"metadata"`
+	Meta           Meta      `json:"metadata"`
 }
 
 type stickyEntry struct {
 	sessionID      uint64
-	proxy          core.Proxy
+	proxy          Proxy
 	startedAt      time.Time
 	nextRotationAt time.Time
 	lastRotationAt time.Time
 	duration       time.Duration
-	meta           core.Meta
+	meta           Meta
 }
 
 // StickyHandler wraps an inner Handler and provides sticky-session affinity.
@@ -37,7 +35,7 @@ type stickyEntry struct {
 //
 // StickyHandler also exposes session introspection methods for the REST API.
 type StickyHandler struct {
-	next     core.Handler
+	next     Handler
 	mu       sync.RWMutex
 	sessions map[string]*stickyEntry
 	nextID   atomic.Uint64
@@ -46,15 +44,15 @@ type StickyHandler struct {
 // Sticky creates a StickyHandler that pins sessions to the same upstream
 // for the TTL encoded in req.SessionTTL. If SessionTTL is 0 or SessionKey
 // is empty, the request passes straight through to next.
-func Sticky(next core.Handler) *StickyHandler {
+func Sticky(next Handler) *StickyHandler {
 	return &StickyHandler{
 		next:     next,
 		sessions: make(map[string]*stickyEntry),
 	}
 }
 
-// Resolve implements core.Handler.
-func (s *StickyHandler) Resolve(ctx context.Context, req *core.Request) (*core.Proxy, error) {
+// Resolve implements Handler.
+func (s *StickyHandler) Resolve(ctx context.Context, req *Request) (*Proxy, error) {
 	if req.SessionTTL <= 0 || req.SessionKey == "" {
 		return s.next.Resolve(ctx, req)
 	}
@@ -138,7 +136,7 @@ func (s *StickyHandler) ForceRotate(ctx context.Context, key string) (*SessionIn
 	duration := e.duration
 	s.mu.RUnlock()
 
-	proxy, err := s.next.Resolve(ctx, &core.Request{
+	proxy, err := s.next.Resolve(ctx, &Request{
 		SessionKey: key,
 		Meta:       meta,
 	})

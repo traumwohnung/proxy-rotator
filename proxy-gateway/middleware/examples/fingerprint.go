@@ -39,11 +39,9 @@ import (
 // Usage:
 //
 //	ca, _ := middleware.GenerateCA()
-//	pipeline := middleware.ParseJSONCreds(
-//	    middleware.Auth(auth,
-//	        examples.Fingerprint(ca, "chrome-latest",
-//	            middleware.Sticky(source),
-//	        ),
+//	pipeline := core.Auth(auth,
+//	    examples.Fingerprint(ca, "chrome-latest",
+//	        core.Sticky(source),
 //	    ),
 //	)
 //	gateway.Run(":8100", pipeline)

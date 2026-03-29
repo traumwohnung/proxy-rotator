@@ -1,11 +1,9 @@
 // Package middleware provides composable Handler wrappers for the proxy pipeline.
-package middleware
+package core
 
 import (
 	"context"
 	"fmt"
-
-	"proxy-gateway/core"
 )
 
 // Authenticator validates (sub, password) credentials.
@@ -17,8 +15,8 @@ type Authenticator interface {
 // Auth wraps an inner Handler with credential validation.
 // The Request.Sub and Request.Password must already be populated
 // (by the gateway's Basic-auth parsing, or programmatically).
-func Auth(auth Authenticator, next core.Handler) core.Handler {
-	return core.HandlerFunc(func(ctx context.Context, req *core.Request) (*core.Proxy, error) {
+func Auth(auth Authenticator, next Handler) Handler {
+	return HandlerFunc(func(ctx context.Context, req *Request) (*Proxy, error) {
 		if err := auth.Authenticate(req.Sub, req.Password); err != nil {
 			return nil, fmt.Errorf("auth: %w", err)
 		}

@@ -12,7 +12,6 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"proxy-gateway/core"
-	"proxy-gateway/middleware"
 	bottingtools "proxy-gateway/source-bottingtools"
 	geonode "proxy-gateway/source-geonode"
 	staticfile "proxy-gateway/source-static-file"
@@ -55,7 +54,7 @@ func LoadConfig(path string) (*Config, error) {
 
 // BuildPipeline constructs the full handler pipeline from config.
 // Returns the pipeline, the sticky session handler (for API introspection), and any error.
-func BuildPipeline(cfg *Config, configDir string) (core.Handler, *middleware.StickyHandler, error) {
+func BuildPipeline(cfg *Config, configDir string) (core.Handler, *core.StickyHandler, error) {
 	if cfg.AuthSub == "" || cfg.AuthPassword == "" {
 		return nil, nil, fmt.Errorf("auth_sub and auth_password are required")
 	}
@@ -78,12 +77,12 @@ func BuildPipeline(cfg *Config, configDir string) (core.Handler, *middleware.Sti
 		return h.Resolve(ctx, req)
 	})
 
-	sticky := middleware.Sticky(router)
+	sticky := core.Sticky(router)
 
 	// Pipeline: parse JSON credentials → authenticate → sticky sessions → route to source
-	pipeline := middleware.ParseJSONCreds(
-		middleware.Auth(
-			middleware.NewSimpleAuth(cfg.AuthSub, cfg.AuthPassword),
+	pipeline := ParseJSONCreds(
+		core.Auth(
+			NewSimpleAuth(cfg.AuthSub, cfg.AuthPassword),
 			sticky,
 		),
 	)

@@ -8,7 +8,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
-	"proxy-gateway/middleware"
+	"proxy-gateway/core"
 )
 
 type apiError struct {
@@ -27,17 +27,17 @@ func bearerAuth(apiKey string, next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-func handleListSessions(sessions *middleware.StickyHandler) http.HandlerFunc {
+func handleListSessions(sessions *core.StickyHandler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		list := sessions.ListSessions()
 		if list == nil {
-			list = []middleware.SessionInfo{}
+			list = []core.SessionInfo{}
 		}
 		writeJSON(w, http.StatusOK, list)
 	}
 }
 
-func handleGetSession(sessions *middleware.StickyHandler) http.HandlerFunc {
+func handleGetSession(sessions *core.StickyHandler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		key := chi.URLParam(r, "key")
 		info := sessions.GetSession(key)
@@ -49,7 +49,7 @@ func handleGetSession(sessions *middleware.StickyHandler) http.HandlerFunc {
 	}
 }
 
-func handleForceRotate(sessions *middleware.StickyHandler) http.HandlerFunc {
+func handleForceRotate(sessions *core.StickyHandler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		key := chi.URLParam(r, "key")
 		info, err := sessions.ForceRotate(r.Context(), key)
