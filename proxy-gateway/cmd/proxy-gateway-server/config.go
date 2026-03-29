@@ -78,7 +78,7 @@ func BuildPipeline(cfg *Config, configDir string) (core.Handler, *core.StickyHan
 
 	pipeline := ParseJSONCreds(
 		core.Auth(
-			NewSimpleAuth(cfg.AuthSub, cfg.AuthPassword),
+			utils.NewMapAuth(map[string]string{cfg.AuthSub: cfg.AuthPassword}),
 			sticky,
 		),
 	)

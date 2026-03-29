@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"proxy-gateway/core"
+	"proxy-gateway/utils"
 )
 
 var testProxy = &core.Proxy{Host: "upstream", Port: 8080}
@@ -13,39 +14,27 @@ var testSource = core.HandlerFunc(func(_ context.Context, _ *core.Request) (*cor
 })
 
 // ---------------------------------------------------------------------------
-// SimpleAuth
+// MapAuth
 // ---------------------------------------------------------------------------
 
-func TestSimpleAuthCorrect(t *testing.T) {
-	a := NewSimpleAuth("alice", "pw")
+func TestMapAuthSingleUser(t *testing.T) {
+	a := utils.NewMapAuth(map[string]string{"alice": "pw"})
 	if err := a.Authenticate("alice", "pw"); err != nil {
 		t.Fatal(err)
 	}
-}
-
-func TestSimpleAuthWrong(t *testing.T) {
-	a := NewSimpleAuth("alice", "pw")
 	if err := a.Authenticate("alice", "wrong"); err == nil {
 		t.Fatal("expected error")
 	}
 }
 
-// ---------------------------------------------------------------------------
-// MultiAuth
-// ---------------------------------------------------------------------------
-
-func TestMultiAuthCorrect(t *testing.T) {
-	a := NewMultiAuth(map[string]string{"alice": "pw1", "bob": "pw2"})
+func TestMapAuthMultiUser(t *testing.T) {
+	a := utils.NewMapAuth(map[string]string{"alice": "pw1", "bob": "pw2"})
 	if err := a.Authenticate("alice", "pw1"); err != nil {
 		t.Fatal(err)
 	}
 	if err := a.Authenticate("bob", "pw2"); err != nil {
 		t.Fatal(err)
 	}
-}
-
-func TestMultiAuthUnknown(t *testing.T) {
-	a := NewMultiAuth(map[string]string{"alice": "pw"})
 	if err := a.Authenticate("charlie", "pw"); err == nil {
 		t.Fatal("expected error for unknown user")
 	}
@@ -100,13 +89,13 @@ func TestParseJSONCredsRejectsMissingSub(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Full pipeline (our server's composition)
+// Full pipeline
 // ---------------------------------------------------------------------------
 
 func TestFullPipeline(t *testing.T) {
 	pipeline := ParseJSONCreds(
 		core.Auth(
-			NewSimpleAuth("alice", "pw"),
+			utils.NewMapAuth(map[string]string{"alice": "pw"}),
 			core.Sticky(testSource),
 		),
 	)
@@ -120,7 +109,6 @@ func TestFullPipeline(t *testing.T) {
 		t.Fatalf("expected proxy, got err=%v", err)
 	}
 
-	// Same raw username → same sticky session.
 	r2, _ := pipeline.Resolve(context.Background(), &core.Request{
 		RawUsername: `{"sub":"alice","set":"test","minutes":5,"meta":{}}`,
 		RawPassword: "pw",
@@ -129,7 +117,6 @@ func TestFullPipeline(t *testing.T) {
 		t.Fatal("sticky should return same proxy")
 	}
 
-	// Bad password.
 	_, err = pipeline.Resolve(context.Background(), &core.Request{
 		RawUsername: `{"sub":"alice","set":"test","minutes":5,"meta":{}}`,
 		RawPassword: "wrong",
