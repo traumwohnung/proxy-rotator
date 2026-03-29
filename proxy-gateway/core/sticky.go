@@ -32,8 +32,6 @@ type stickyEntry struct {
 // StickyHandler wraps an inner Handler and provides sticky-session affinity.
 // Requests with the same SessionKey get the same upstream proxy for the
 // configured TTL.
-//
-// StickyHandler also exposes session introspection methods for the REST API.
 type StickyHandler struct {
 	next     Handler
 	mu       sync.RWMutex
@@ -42,7 +40,7 @@ type StickyHandler struct {
 }
 
 // Sticky creates a StickyHandler that pins sessions to the same upstream
-// for the TTL encoded in req.SessionTTL. If SessionTTL is 0 or SessionKey
+// for the TTL encoded in SessionTTL(ctx). If SessionTTL is 0 or SessionKey
 // is empty, the request passes straight through to next.
 func Sticky(next Handler) *StickyHandler {
 	return &StickyHandler{
@@ -52,54 +50,54 @@ func Sticky(next Handler) *StickyHandler {
 }
 
 // Resolve implements Handler.
-func (s *StickyHandler) Resolve(ctx context.Context, req *Request) (*Proxy, error) {
-	if req.SessionTTL <= 0 || req.SessionKey == "" {
+func (s *StickyHandler) Resolve(ctx context.Context, req *Request) (*Result, error) {
+	sessionKey := SessionKey(ctx)
+	sessionTTL := SessionTTL(ctx)
+
+	if sessionTTL <= 0 || sessionKey == "" {
 		return s.next.Resolve(ctx, req)
 	}
 
-	duration := time.Duration(req.SessionTTL) * time.Minute
+	duration := time.Duration(sessionTTL) * time.Minute
 
-	// Fast path: valid existing session.
 	s.mu.RLock()
-	entry, ok := s.sessions[req.SessionKey]
+	entry, ok := s.sessions[sessionKey]
 	if ok && time.Since(entry.startedAt) < entry.duration {
 		p := entry.proxy
 		s.mu.RUnlock()
-		return &p, nil
+		return ProxyResult(&p), nil
 	}
 	s.mu.RUnlock()
 
-	// Ask inner handler for a new proxy.
-	proxy, err := s.next.Resolve(ctx, req)
-	if err != nil || proxy == nil {
-		return proxy, err
+	result, err := s.next.Resolve(ctx, req)
+	if err != nil || result == nil || result.Proxy == nil {
+		return result, err
 	}
 
 	now := time.Now().UTC()
 	newEntry := &stickyEntry{
 		sessionID:      s.nextID.Add(1) - 1,
-		proxy:          *proxy,
+		proxy:          *result.Proxy,
 		startedAt:      now,
 		nextRotationAt: now.Add(duration),
 		lastRotationAt: now,
 		duration:       duration,
-		meta:           req.Meta,
+		meta:           GetMeta(ctx),
 	}
 
 	s.mu.Lock()
-	// Double-check under write lock.
-	if existing, ok := s.sessions[req.SessionKey]; ok && time.Since(existing.startedAt) < existing.duration {
+	if existing, ok := s.sessions[sessionKey]; ok && time.Since(existing.startedAt) < existing.duration {
 		p := existing.proxy
 		s.mu.Unlock()
-		return &p, nil
+		return ProxyResult(&p), nil
 	}
-	s.sessions[req.SessionKey] = newEntry
+	s.sessions[sessionKey] = newEntry
 	s.mu.Unlock()
 
-	return proxy, nil
+	return result, nil
 }
 
-// GetSession returns info for an active session, or nil.
+// GetSession returns info about an active session, or nil.
 func (s *StickyHandler) GetSession(key string) *SessionInfo {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -110,7 +108,7 @@ func (s *StickyHandler) GetSession(key string) *SessionInfo {
 	return infoFrom(key, e)
 }
 
-// ListSessions returns all active (non-expired) sessions.
+// ListSessions returns info about all active sessions.
 func (s *StickyHandler) ListSessions() []SessionInfo {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -123,8 +121,7 @@ func (s *StickyHandler) ListSessions() []SessionInfo {
 	return out
 }
 
-// ForceRotate gets a new proxy from the inner handler and replaces the
-// session's pinned proxy.
+// ForceRotate resolves a new proxy for the given session key.
 func (s *StickyHandler) ForceRotate(ctx context.Context, key string) (*SessionInfo, error) {
 	s.mu.RLock()
 	e, ok := s.sessions[key]
@@ -136,11 +133,11 @@ func (s *StickyHandler) ForceRotate(ctx context.Context, key string) (*SessionIn
 	duration := e.duration
 	s.mu.RUnlock()
 
-	proxy, err := s.next.Resolve(ctx, &Request{
-		SessionKey: key,
-		Meta:       meta,
-	})
-	if err != nil || proxy == nil {
+	ctx = WithSessionKey(ctx, key)
+	ctx = WithMeta(ctx, meta)
+
+	result, err := s.next.Resolve(ctx, &Request{})
+	if err != nil || result == nil || result.Proxy == nil {
 		return nil, err
 	}
 
@@ -151,7 +148,7 @@ func (s *StickyHandler) ForceRotate(ctx context.Context, key string) (*SessionIn
 		s.mu.Unlock()
 		return nil, nil
 	}
-	e.proxy = *proxy
+	e.proxy = *result.Proxy
 	e.lastRotationAt = now
 	e.nextRotationAt = now.Add(duration)
 	info := infoFrom(key, e)
@@ -160,7 +157,7 @@ func (s *StickyHandler) ForceRotate(ctx context.Context, key string) (*SessionIn
 	return info, nil
 }
 
-// SpawnCleanup starts a goroutine that evicts expired sessions every 60s.
+// SpawnCleanup starts a background goroutine that prunes expired sessions.
 func (s *StickyHandler) SpawnCleanup() {
 	go func() {
 		ticker := time.NewTicker(60 * time.Second)

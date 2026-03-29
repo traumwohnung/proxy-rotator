@@ -40,13 +40,13 @@ func BuildSource(cfg *Config, configDir string) (*Source, error) {
 }
 
 // Resolve implements core.Handler — returns the least-used proxy.
-func (s *Source) Resolve(_ context.Context, _ *core.Request) (*core.Proxy, error) {
+func (s *Source) Resolve(_ context.Context, _ *core.Request) (*core.Result, error) {
 	p := s.pool.Next()
 	if p == nil {
 		return nil, fmt.Errorf("empty proxy pool")
 	}
 	cp := *p
-	return &cp, nil
+	return core.ProxyResult(&cp), nil
 }
 
 func (s *Source) Describe() string {

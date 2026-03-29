@@ -9,17 +9,16 @@ import (
 )
 
 // ParseJSONCreds is middleware that parses RawUsername as a JSON object and
-// populates the structured Request fields (Sub, Set, SessionTTL, Meta,
-// SessionKey). RawPassword is copied to Password.
+// populates context with Sub, Set, SessionTTL, Meta, SessionKey, and Password.
 //
 // Expected JSON format:
 //
 //	{"sub":"alice", "set":"residential", "minutes":5, "meta":{"app":"crawler"}}
 //
 // This is specific to our username encoding — other systems can write their
-// own credential-parsing middleware that populates Request differently.
+// own credential-parsing middleware that populates context differently.
 func ParseJSONCreds(next core.Handler) core.Handler {
-	return core.HandlerFunc(func(ctx context.Context, req *core.Request) (*core.Proxy, error) {
+	return core.HandlerFunc(func(ctx context.Context, req *core.Request) (*core.Result, error) {
 		if req.RawUsername == "" {
 			return nil, fmt.Errorf("empty username")
 		}
@@ -40,12 +39,12 @@ func ParseJSONCreds(next core.Handler) core.Handler {
 			return nil, fmt.Errorf("'set' must not be empty")
 		}
 
-		req.Sub = parsed.Sub
-		req.Password = req.RawPassword
-		req.Set = parsed.Set
-		req.SessionTTL = parsed.Minutes
-		req.Meta = core.Meta(parsed.Meta)
-		req.SessionKey = req.RawUsername // stable key for affinity
+		ctx = core.WithSub(ctx, parsed.Sub)
+		ctx = core.WithPassword(ctx, req.RawPassword)
+		ctx = core.WithSet(ctx, parsed.Set)
+		ctx = core.WithSessionTTL(ctx, parsed.Minutes)
+		ctx = core.WithMeta(ctx, core.Meta(parsed.Meta))
+		ctx = core.WithSessionKey(ctx, req.RawUsername) // stable key for affinity
 
 		return next.Resolve(ctx, req)
 	})

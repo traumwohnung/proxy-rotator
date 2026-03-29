@@ -1,12 +1,3 @@
-// Package gateway provides HTTP and SOCKS5 proxy transports.
-//
-// The gateway extracts raw credentials from the transport protocol and puts
-// them into Request.RawUsername / RawPassword. For CONNECT requests it also
-// sets Request.Conn (the hijacked client connection). For plain HTTP it sets
-// Request.HTTPRequest.
-//
-// If a Handler returns nil Proxy and nil error, the gateway assumes the
-// middleware has handled the connection itself (e.g. MITM interception).
 package gateway
 
 import (
@@ -22,14 +13,22 @@ import (
 	"proxy-gateway/core"
 )
 
-// Run starts an HTTP proxy server on addr and blocks.
-func Run(addr string, handler core.Handler) error {
-	slog.Info("HTTP proxy gateway listening", "addr", addr)
-	return http.ListenAndServe(addr, HTTPHandler(handler))
+// ---------------------------------------------------------------------------
+// HTTPDownstream — implements core.Downstream for HTTP proxy protocol
+// ---------------------------------------------------------------------------
+
+// HTTPDownstream accepts HTTP proxy connections (CONNECT + plain HTTP).
+type HTTPDownstream struct {
+	Upstream core.Upstream
 }
 
-// HTTPHandler returns an http.Handler that serves HTTP proxy requests.
-func HTTPHandler(handler core.Handler) http.Handler {
+// Serve implements core.Downstream.
+func (d *HTTPDownstream) Serve(addr string, handler core.Handler) error {
+	slog.Info("HTTP proxy gateway listening", "addr", addr)
+	return http.ListenAndServe(addr, d.httpHandler(handler))
+}
+
+func (d *HTTPDownstream) httpHandler(handler core.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		clientIP, _, _ := net.SplitHostPort(r.RemoteAddr)
 
@@ -42,18 +41,14 @@ func HTTPHandler(handler core.Handler) http.Handler {
 		}
 
 		if r.Method == http.MethodConnect {
-			serveConnect(w, r, rawUsername, rawPassword, handler)
+			d.serveConnect(w, r, rawUsername, rawPassword, handler)
 		} else {
-			servePlainHTTP(w, r, rawUsername, rawPassword, handler)
+			d.servePlainHTTP(w, r, rawUsername, rawPassword, handler)
 		}
 	})
 }
 
-// ---------------------------------------------------------------------------
-// CONNECT — hijack, set Conn, let pipeline handle it
-// ---------------------------------------------------------------------------
-
-func serveConnect(w http.ResponseWriter, r *http.Request, rawUser, rawPass string, handler core.Handler) {
+func (d *HTTPDownstream) serveConnect(w http.ResponseWriter, r *http.Request, rawUser, rawPass string, handler core.Handler) {
 	hj, ok := w.(http.Hijacker)
 	if !ok {
 		http.Error(w, "hijacking not supported", http.StatusInternalServerError)
@@ -70,60 +65,47 @@ func serveConnect(w http.ResponseWriter, r *http.Request, rawUser, rawPass strin
 		RawUsername: rawUser,
 		RawPassword: rawPass,
 		Target:      r.Host,
-		Conn:        clientConn, // middleware can take over
+		Conn:        clientConn,
 	}
 
-	proxy, err := handler.Resolve(r.Context(), req)
+	result, err := handler.Resolve(r.Context(), req)
 	if err != nil {
 		slog.Warn("resolve error", "target", r.Host, "err", err)
 		clientConn.Close()
 		return
 	}
 
-	// nil proxy + nil error = middleware handled the connection itself (e.g. MITM).
-	if proxy == nil {
+	// nil result or nil proxy = middleware handled it (e.g. MITM).
+	if result == nil || result.Proxy == nil {
 		return
 	}
 
-	// Normal tunnel: dial upstream and relay.
 	defer clientConn.Close()
 
+	proxy := result.Proxy
 	slog.Info("tunneling",
 		"target", r.Host,
 		"upstream", fmt.Sprintf("%s:%d", proxy.Host, proxy.Port),
 		"upstream_proto", proxy.GetProtocol(),
 	)
 
-	var handle core.ConnHandle
-	if tracker, ok := handler.(core.ConnectionTracker); ok {
-		handle, err = tracker.OpenConnection(req.Sub)
-		if err != nil {
-			slog.Warn("connection rejected", "sub", req.Sub, "err", err)
-			return
-		}
-	}
-
-	upstreamConn, err := dialUpstream(proxy, r.Host)
+	upstreamConn, err := d.Upstream.Dial(r.Context(), proxy, r.Host)
 	if err != nil {
 		slog.Error("upstream dial failed", "err", err)
-		if handle != nil {
-			handle.Close(0, 0)
+		if result.ConnHandle != nil {
+			result.ConnHandle.Close(0, 0)
 		}
 		return
 	}
 	defer upstreamConn.Close()
 
-	sent, received := relay(clientConn, upstreamConn, handle)
-	if handle != nil {
-		handle.Close(sent, received)
+	sent, received := relay(clientConn, upstreamConn, result.ConnHandle)
+	if result.ConnHandle != nil {
+		result.ConnHandle.Close(sent, received)
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Plain HTTP — set HTTPRequest, let pipeline handle it
-// ---------------------------------------------------------------------------
-
-func servePlainHTTP(w http.ResponseWriter, r *http.Request, rawUser, rawPass string, handler core.Handler) {
+func (d *HTTPDownstream) servePlainHTTP(w http.ResponseWriter, r *http.Request, rawUser, rawPass string, handler core.Handler) {
 	req := &core.Request{
 		RawUsername: rawUser,
 		RawPassword: rawPass,
@@ -131,38 +113,34 @@ func servePlainHTTP(w http.ResponseWriter, r *http.Request, rawUser, rawPass str
 		HTTPRequest: r,
 	}
 
-	proxy, err := handler.Resolve(r.Context(), req)
+	result, err := handler.Resolve(r.Context(), req)
 	if err != nil {
 		slog.Warn("resolve error", "target", r.Host, "err", err)
 		http.Error(w, err.Error(), http.StatusForbidden)
 		return
 	}
 
-	// If middleware provided a synthetic response, send it.
-	if req.HTTPResponse != nil {
-		writeHTTPResponse(w, req.HTTPResponse)
+	// Synthetic response from middleware.
+	if result != nil && result.HTTPResponse != nil {
+		resp := result.HTTPResponse
+		if result.ResponseHook != nil {
+			resp = result.ResponseHook(resp)
+		}
+		writeHTTPResponse(w, resp)
 		return
 	}
 
-	if proxy == nil {
+	if result == nil || result.Proxy == nil {
 		http.Error(w, "no proxy available", http.StatusServiceUnavailable)
 		return
 	}
 
+	proxy := result.Proxy
 	slog.Info("forwarding",
 		"method", r.Method,
 		"uri", r.RequestURI,
 		"upstream", fmt.Sprintf("%s:%d", proxy.Host, proxy.Port),
 	)
-
-	var handle core.ConnHandle
-	if tracker, ok := handler.(core.ConnectionTracker); ok {
-		handle, err = tracker.OpenConnection(req.Sub)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusTooManyRequests)
-			return
-		}
-	}
 
 	var headers []string
 	for name, values := range r.Header {
@@ -180,15 +158,15 @@ func servePlainHTTP(w http.ResponseWriter, r *http.Request, rawUser, rawPass str
 
 	raw, err := ForwardHTTP(r.Method, uri, headers, r.Body, proxy)
 
-	if handle != nil {
+	if result.ConnHandle != nil {
 		var reqBytes int64
 		if r.ContentLength > 0 {
 			reqBytes = r.ContentLength
 		}
 		respBytes := int64(len(raw))
-		handle.RecordTraffic(true, reqBytes, func() {})
-		handle.RecordTraffic(false, respBytes, func() {})
-		handle.Close(reqBytes, respBytes)
+		result.ConnHandle.RecordTraffic(true, reqBytes, func() {})
+		result.ConnHandle.RecordTraffic(false, respBytes, func() {})
+		result.ConnHandle.Close(reqBytes, respBytes)
 	}
 
 	if err != nil {
@@ -196,6 +174,23 @@ func servePlainHTTP(w http.ResponseWriter, r *http.Request, rawUser, rawPass str
 		return
 	}
 	writeRawResponse(w, raw)
+}
+
+// ---------------------------------------------------------------------------
+// Legacy compatibility — Run / HTTPHandler
+// ---------------------------------------------------------------------------
+
+// Run starts an HTTP proxy gateway with the default upstream dialer.
+func Run(addr string, handler core.Handler) error {
+	d := &HTTPDownstream{Upstream: DefaultUpstream()}
+	return d.Serve(addr, handler)
+}
+
+// HTTPHandler returns an http.Handler for mounting in a chi router or
+// similar. Uses the default upstream dialer.
+func HTTPHandler(handler core.Handler) http.Handler {
+	d := &HTTPDownstream{Upstream: DefaultUpstream()}
+	return d.httpHandler(handler)
 }
 
 // ---------------------------------------------------------------------------

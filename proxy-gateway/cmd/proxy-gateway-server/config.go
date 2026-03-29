@@ -69,10 +69,11 @@ func BuildPipeline(cfg *Config, configDir string) (core.Handler, *core.StickyHan
 		sources[raw.Name] = src
 	}
 
-	router := core.HandlerFunc(func(ctx context.Context, req *core.Request) (*core.Proxy, error) {
-		h, ok := sources[req.Set]
+	router := core.HandlerFunc(func(ctx context.Context, req *core.Request) (*core.Result, error) {
+		set := core.Set(ctx)
+		h, ok := sources[set]
 		if !ok {
-			return nil, fmt.Errorf("unknown proxy set %q", req.Set)
+			return nil, fmt.Errorf("unknown proxy set %q", set)
 		}
 		return h.Resolve(ctx, req)
 	})

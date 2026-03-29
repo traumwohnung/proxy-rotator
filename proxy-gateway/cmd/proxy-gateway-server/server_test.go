@@ -8,8 +8,8 @@ import (
 )
 
 var testProxy = &core.Proxy{Host: "upstream", Port: 8080}
-var testSource = core.HandlerFunc(func(_ context.Context, _ *core.Request) (*core.Proxy, error) {
-	return testProxy, nil
+var testSource = core.HandlerFunc(func(_ context.Context, _ *core.Request) (*core.Result, error) {
+	return core.ProxyResult(testProxy), nil
 })
 
 // ---------------------------------------------------------------------------
@@ -55,26 +55,26 @@ func TestMultiAuthUnknown(t *testing.T) {
 // ParseJSONCreds
 // ---------------------------------------------------------------------------
 
-func TestParseJSONCredsPopulatesFields(t *testing.T) {
-	h := ParseJSONCreds(core.HandlerFunc(func(_ context.Context, req *core.Request) (*core.Proxy, error) {
-		if req.Sub != "alice" || req.Set != "res" || req.SessionTTL != 5 {
-			t.Fatalf("unexpected: sub=%q set=%q ttl=%d", req.Sub, req.Set, req.SessionTTL)
+func TestParseJSONCredsPopulatesContext(t *testing.T) {
+	h := ParseJSONCreds(core.HandlerFunc(func(ctx context.Context, _ *core.Request) (*core.Result, error) {
+		if core.Sub(ctx) != "alice" || core.Set(ctx) != "res" || core.SessionTTL(ctx) != 5 {
+			t.Fatalf("unexpected: sub=%q set=%q ttl=%d", core.Sub(ctx), core.Set(ctx), core.SessionTTL(ctx))
 		}
-		if req.Password != "s3cret" {
-			t.Fatalf("expected password=s3cret, got %q", req.Password)
+		if core.Password(ctx) != "s3cret" {
+			t.Fatalf("expected password=s3cret, got %q", core.Password(ctx))
 		}
-		if req.Meta.GetString("app") != "test" {
+		if core.GetMeta(ctx).GetString("app") != "test" {
 			t.Fatal("expected meta.app=test")
 		}
-		return testProxy, nil
+		return core.ProxyResult(testProxy), nil
 	}))
 	req := &core.Request{
 		RawUsername: `{"sub":"alice","set":"res","minutes":5,"meta":{"app":"test"}}`,
 		RawPassword: "s3cret",
 	}
-	p, err := h.Resolve(context.Background(), req)
-	if err != nil || p.Host != "upstream" {
-		t.Fatalf("unexpected: err=%v proxy=%+v", err, p)
+	r, err := h.Resolve(context.Background(), req)
+	if err != nil || r.Proxy.Host != "upstream" {
+		t.Fatalf("unexpected: err=%v result=%+v", err, r)
 	}
 }
 
@@ -115,17 +115,17 @@ func TestFullPipeline(t *testing.T) {
 		RawUsername: `{"sub":"alice","set":"test","minutes":5,"meta":{}}`,
 		RawPassword: "pw",
 	}
-	p, err := pipeline.Resolve(context.Background(), req)
-	if err != nil || p == nil {
+	r, err := pipeline.Resolve(context.Background(), req)
+	if err != nil || r == nil || r.Proxy == nil {
 		t.Fatalf("expected proxy, got err=%v", err)
 	}
 
 	// Same raw username → same sticky session.
-	p2, _ := pipeline.Resolve(context.Background(), &core.Request{
+	r2, _ := pipeline.Resolve(context.Background(), &core.Request{
 		RawUsername: `{"sub":"alice","set":"test","minutes":5,"meta":{}}`,
 		RawPassword: "pw",
 	})
-	if p2.Port != p.Port {
+	if r2.Proxy.Port != r.Proxy.Port {
 		t.Fatal("sticky should return same proxy")
 	}
 

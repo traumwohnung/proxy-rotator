@@ -53,7 +53,7 @@ func (tf Timeframe) duration() time.Duration {
 	}
 }
 
-// RateLimit describes a single constraint.
+// RateLimit describes a single rate limit rule.
 type RateLimit struct {
 	Type      LimitType
 	Timeframe Timeframe
@@ -69,9 +69,8 @@ func (r RateLimit) windowDuration() time.Duration {
 	return r.Timeframe.duration() * time.Duration(w)
 }
 
-// RateLimitHandler wraps an inner Handler and enforces per-sub rate limits.
-// It also implements core.ConnectionTracker so the gateway can feed it
-// real-time traffic data for mid-connection enforcement.
+// RateLimitHandler wraps an inner Handler with rate limiting.
+// It injects a ConnHandle into the Result for connection-level tracking.
 type RateLimitHandler struct {
 	next   core.Handler
 	limits func(sub string) []RateLimit
@@ -79,20 +78,22 @@ type RateLimitHandler struct {
 	state  map[string]*userState
 }
 
-// RateLimitOption configures the rate limit handler.
+// RateLimitOption configures a RateLimitHandler.
 type RateLimitOption func(*RateLimitHandler)
 
-// WithLimits sets a per-sub limit function.
+// WithLimits sets a dynamic limit function.
 func WithLimits(fn func(sub string) []RateLimit) RateLimitOption {
 	return func(h *RateLimitHandler) { h.limits = fn }
 }
 
-// StaticLimits applies the same limits to all subs.
+// StaticLimits sets the same limits for all users.
 func StaticLimits(limits []RateLimit) RateLimitOption {
 	return WithLimits(func(_ string) []RateLimit { return limits })
 }
 
-// RateLimit creates a rate-limiting middleware.
+// RateLimiting wraps next with rate limiting. Unlike the old ConnectionTracker
+// interface, this works at any position in the pipeline — it wraps
+// Result.ConnHandle so the gateway always sees the tracker.
 func RateLimiting(next core.Handler, opts ...RateLimitOption) *RateLimitHandler {
 	h := &RateLimitHandler{
 		next:  next,
@@ -107,31 +108,39 @@ func RateLimiting(next core.Handler, opts ...RateLimitOption) *RateLimitHandler 
 	return h
 }
 
-// Resolve implements core.Handler.
-func (h *RateLimitHandler) Resolve(ctx context.Context, req *core.Request) (*core.Proxy, error) {
-	limits := h.limits(req.Sub)
+// Resolve implements core.Handler. It checks pre-connection limits,
+// delegates to the inner handler, then wraps the Result.ConnHandle.
+func (h *RateLimitHandler) Resolve(ctx context.Context, req *core.Request) (*core.Result, error) {
+	sub := core.Sub(ctx)
+	limits := h.limits(sub)
 	if len(limits) == 0 {
 		return h.next.Resolve(ctx, req)
 	}
-	st := h.getState(req.Sub, limits)
-	if err := checkWindowedLimits(limits, st); err != nil {
-		return nil, err
-	}
-	return h.next.Resolve(ctx, req)
-}
 
-// OpenConnection implements core.ConnectionTracker.
-func (h *RateLimitHandler) OpenConnection(sub string) (core.ConnHandle, error) {
-	limits := h.limits(sub)
-	if len(limits) == 0 {
-		return &noopHandle{}, nil
-	}
 	st := h.getState(sub, limits)
 
+	// Check windowed limits before resolving.
 	if err := checkWindowedLimits(limits, st); err != nil {
 		return nil, err
 	}
 
+	result, err := h.next.Resolve(ctx, req)
+	if err != nil || result == nil || result.Proxy == nil {
+		return result, err
+	}
+
+	// Create a ConnHandle for this connection and chain it with any inner one.
+	handle, err := h.openConnection(sub, limits, st)
+	if err != nil {
+		return nil, err
+	}
+	result.ConnHandle = core.ChainHandles(handle, result.ConnHandle)
+
+	return result, nil
+}
+
+// openConnection creates a tracked ConnHandle, checking concurrent/total limits.
+func (h *RateLimitHandler) openConnection(sub string, limits []RateLimit, st *userState) (core.ConnHandle, error) {
 	for _, rl := range limits {
 		if rl.Type != LimitConcurrentConnections {
 			continue
@@ -148,7 +157,7 @@ func (h *RateLimitHandler) OpenConnection(sub string) (core.ConnHandle, error) {
 			continue
 		}
 		if st.counters[i].Add(1) > rl.Max {
-			st.concurrent.Add(-1) // rollback concurrent
+			st.concurrent.Add(-1)
 			return nil, fmt.Errorf("total connection limit (%d) exceeded for %q", rl.Max, sub)
 		}
 	}
@@ -156,7 +165,21 @@ func (h *RateLimitHandler) OpenConnection(sub string) (core.ConnHandle, error) {
 	return &rlConnHandle{limits: limits, state: st}, nil
 }
 
-// ResetUser clears all counters for sub.
+// OpenConnection is a standalone method for creating tracked handles
+// (used by tests and direct callers).
+func (h *RateLimitHandler) OpenConnection(sub string) (core.ConnHandle, error) {
+	limits := h.limits(sub)
+	if len(limits) == 0 {
+		return &noopHandle{}, nil
+	}
+	st := h.getState(sub, limits)
+	if err := checkWindowedLimits(limits, st); err != nil {
+		return nil, err
+	}
+	return h.openConnection(sub, limits, st)
+}
+
+// ResetUser clears all tracked state for a user.
 func (h *RateLimitHandler) ResetUser(sub string) {
 	h.mu.Lock()
 	delete(h.state, sub)
@@ -194,19 +217,21 @@ func checkWindowedLimits(limits []RateLimit, st *userState) error {
 }
 
 func limitLabel(rl RateLimit) string {
-	typ := ""
 	switch rl.Type {
 	case LimitUploadBytes:
-		typ = "upload"
+		return "upload"
 	case LimitDownloadBytes:
-		typ = "download"
+		return "download"
 	case LimitTotalBytes:
-		typ = "total bandwidth"
+		return "total bandwidth"
 	default:
-		typ = "limit"
+		return "limit"
 	}
-	return typ
 }
+
+// ---------------------------------------------------------------------------
+// Internal state tracking
+// ---------------------------------------------------------------------------
 
 type userState struct {
 	concurrent atomic.Int64
@@ -264,7 +289,7 @@ func (noopHandle) RecordTraffic(_ bool, _ int64, _ func()) {}
 func (noopHandle) Close(_, _ int64)                        {}
 
 // ---------------------------------------------------------------------------
-// rolling counter
+// Rolling counter
 // ---------------------------------------------------------------------------
 
 const numBuckets = 60

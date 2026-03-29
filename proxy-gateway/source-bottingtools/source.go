@@ -32,14 +32,14 @@ func BuildSource(cfg *Config) (core.Handler, error) {
 	return FromConfig(cfg)
 }
 
-func (s *Source) Resolve(_ context.Context, req *core.Request) (*core.Proxy, error) {
-	username := BuildUsername(s.accountUser, s.product, req.Meta)
-	return &core.Proxy{
+func (s *Source) Resolve(ctx context.Context, _ *core.Request) (*core.Result, error) {
+	username := BuildUsername(s.accountUser, s.product, core.GetMeta(ctx))
+	return core.ProxyResult(&core.Proxy{
 		Host:     s.host,
 		Port:     1337,
 		Username: username,
 		Password: s.password,
-	}, nil
+	}), nil
 }
 
 func (s *Source) Describe() string {

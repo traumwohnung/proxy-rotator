@@ -9,27 +9,32 @@ import (
 	"proxy-gateway/core"
 )
 
-// RunSOCKS5 starts a SOCKS5 proxy server.
-// Raw credentials go into Request.RawUsername / RawPassword.
-// Request.Conn is set to the client connection.
-func RunSOCKS5(addr string, handler core.Handler) error {
+// ---------------------------------------------------------------------------
+// SOCKS5Downstream — implements core.Downstream for SOCKS5 protocol
+// ---------------------------------------------------------------------------
+
+// SOCKS5Downstream accepts SOCKS5 proxy connections.
+type SOCKS5Downstream struct {
+	Upstream core.Upstream
+}
+
+// Serve implements core.Downstream.
+func (d *SOCKS5Downstream) Serve(addr string, handler core.Handler) error {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		return fmt.Errorf("listening on %s: %w", addr, err)
+		return fmt.Errorf("socks5 listen %s: %w", addr, err)
 	}
-	defer ln.Close()
 	slog.Info("SOCKS5 proxy gateway listening", "addr", addr)
-
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			return fmt.Errorf("accept: %w", err)
 		}
-		go handleSOCKS5Conn(conn, handler)
+		go d.handleConn(conn, handler)
 	}
 }
 
-func handleSOCKS5Conn(conn net.Conn, handler core.Handler) {
+func (d *SOCKS5Downstream) handleConn(conn net.Conn, handler core.Handler) {
 	defer conn.Close()
 
 	// Greeting.
@@ -92,38 +97,28 @@ func handleSOCKS5Conn(conn net.Conn, handler core.Handler) {
 		RawUsername: rawUsername,
 		RawPassword: rawPassword,
 		Target:      target,
-		Conn:        conn, // middleware can take over
+		Conn:        conn,
 	}
 
-	proxy, err := handler.Resolve(nil, req)
+	result, err := handler.Resolve(nil, req)
 	if err != nil {
 		slog.Warn("resolve error", "err", err)
 		sendSOCKS5Reply(conn, 0x02)
 		return
 	}
 
-	// nil proxy = middleware handled it (e.g. MITM).
-	if proxy == nil {
+	// nil result or nil proxy = middleware handled it (e.g. MITM).
+	if result == nil || result.Proxy == nil {
 		return
 	}
 
-	// Normal tunnel.
-	var handle core.ConnHandle
-	if tracker, ok := handler.(core.ConnectionTracker); ok {
-		handle, err = tracker.OpenConnection(req.Sub)
-		if err != nil {
-			slog.Warn("connection rejected", "sub", req.Sub, "err", err)
-			sendSOCKS5Reply(conn, 0x02)
-			return
-		}
-	}
-
-	upstreamConn, err := dialUpstream(proxy, target)
+	proxy := result.Proxy
+	upstreamConn, err := d.Upstream.Dial(nil, proxy, target)
 	if err != nil {
 		slog.Error("upstream dial failed", "err", err)
 		sendSOCKS5Reply(conn, 0x05)
-		if handle != nil {
-			handle.Close(0, 0)
+		if result.ConnHandle != nil {
+			result.ConnHandle.Close(0, 0)
 		}
 		return
 	}
@@ -137,11 +132,25 @@ func handleSOCKS5Conn(conn net.Conn, handler core.Handler) {
 		"upstream_proto", proxy.GetProtocol(),
 	)
 
-	sent, received := relay(conn, upstreamConn, handle)
-	if handle != nil {
-		handle.Close(sent, received)
+	sent, received := relay(conn, upstreamConn, result.ConnHandle)
+	if result.ConnHandle != nil {
+		result.ConnHandle.Close(sent, received)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Legacy compatibility
+// ---------------------------------------------------------------------------
+
+// RunSOCKS5 starts a SOCKS5 proxy gateway with the default upstream dialer.
+func RunSOCKS5(addr string, handler core.Handler) error {
+	d := &SOCKS5Downstream{Upstream: DefaultUpstream()}
+	return d.Serve(addr, handler)
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 func readSOCKS5Address(conn net.Conn, atyp byte) (string, error) {
 	var host string

@@ -26,18 +26,18 @@ func BuildSource(cfg *Config) (core.Handler, error) {
 	return FromConfig(cfg)
 }
 
-func (s *Source) Resolve(_ context.Context, _ *core.Request) (*core.Proxy, error) {
+func (s *Source) Resolve(_ context.Context, _ *core.Request) (*core.Result, error) {
 	proto := core.ProtocolHTTP
 	if s.config.Protocol == GeonodeProtocolSocks5 {
 		proto = core.ProtocolSOCKS5
 	}
-	return &core.Proxy{
+	return core.ProxyResult(&core.Proxy{
 		Host:     s.config.Host(),
 		Port:     s.config.Port(),
 		Username: BuildUsername(&s.config),
 		Password: s.password,
 		Protocol: proto,
-	}, nil
+	}), nil
 }
 
 func (s *Source) Describe() string {

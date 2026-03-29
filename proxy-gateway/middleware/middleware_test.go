@@ -12,8 +12,8 @@ import (
 // ---------------------------------------------------------------------------
 
 func TestRateLimitConcurrentConnections(t *testing.T) {
-	source := core.HandlerFunc(func(_ context.Context, _ *core.Request) (*core.Proxy, error) {
-		return &core.Proxy{Host: "upstream", Port: 8080}, nil
+	source := core.HandlerFunc(func(_ context.Context, _ *core.Request) (*core.Result, error) {
+		return core.ProxyResult(&core.Proxy{Host: "upstream", Port: 8080}), nil
 	})
 	rl := RateLimiting(source, StaticLimits([]RateLimit{
 		{Type: LimitConcurrentConnections, Timeframe: Realtime, Max: 2},
@@ -37,8 +37,8 @@ func TestRateLimitConcurrentConnections(t *testing.T) {
 }
 
 func TestRateLimitBandwidthMidConnection(t *testing.T) {
-	source := core.HandlerFunc(func(_ context.Context, _ *core.Request) (*core.Proxy, error) {
-		return &core.Proxy{Host: "upstream", Port: 8080}, nil
+	source := core.HandlerFunc(func(_ context.Context, _ *core.Request) (*core.Result, error) {
+		return core.ProxyResult(&core.Proxy{Host: "upstream", Port: 8080}), nil
 	})
 	rl := RateLimiting(source, StaticLimits([]RateLimit{
 		{Type: LimitUploadBytes, Timeframe: Hourly, Window: 1, Max: 100},
@@ -57,4 +57,24 @@ func TestRateLimitBandwidthMidConnection(t *testing.T) {
 		t.Fatal("expected cancel when upload limit exceeded")
 	}
 	h.Close(110, 0)
+}
+
+func TestRateLimitWrapsResultConnHandle(t *testing.T) {
+	source := core.HandlerFunc(func(_ context.Context, _ *core.Request) (*core.Result, error) {
+		return core.ProxyResult(&core.Proxy{Host: "upstream", Port: 8080}), nil
+	})
+	rl := RateLimiting(source, StaticLimits([]RateLimit{
+		{Type: LimitConcurrentConnections, Timeframe: Realtime, Max: 10},
+	}))
+
+	ctx := core.WithSub(context.Background(), "alice")
+	result, err := rl.Resolve(ctx, &core.Request{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ConnHandle == nil {
+		t.Fatal("expected ConnHandle in result")
+	}
+	// Close it to decrement concurrent counter.
+	result.ConnHandle.Close(0, 0)
 }

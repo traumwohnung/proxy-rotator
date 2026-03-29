@@ -16,22 +16,26 @@ func (a *stubAuth) Authenticate(sub, password string) error {
 }
 
 func TestAuthPassesOnValidCredentials(t *testing.T) {
-	source := HandlerFunc(func(_ context.Context, _ *Request) (*Proxy, error) {
-		return &Proxy{Host: "upstream", Port: 8080}, nil
+	source := HandlerFunc(func(_ context.Context, _ *Request) (*Result, error) {
+		return ProxyResult(&Proxy{Host: "upstream", Port: 8080}), nil
 	})
 	h := Auth(&stubAuth{"alice", "pw"}, source)
-	p, err := h.Resolve(context.Background(), &Request{Sub: "alice", Password: "pw"})
-	if err != nil || p == nil {
+	ctx := WithSub(context.Background(), "alice")
+	ctx = WithPassword(ctx, "pw")
+	r, err := h.Resolve(ctx, &Request{})
+	if err != nil || r == nil || r.Proxy == nil {
 		t.Fatalf("expected proxy, got err=%v", err)
 	}
 }
 
 func TestAuthRejectsInvalidCredentials(t *testing.T) {
-	source := HandlerFunc(func(_ context.Context, _ *Request) (*Proxy, error) {
-		return &Proxy{Host: "upstream", Port: 8080}, nil
+	source := HandlerFunc(func(_ context.Context, _ *Request) (*Result, error) {
+		return ProxyResult(&Proxy{Host: "upstream", Port: 8080}), nil
 	})
 	h := Auth(&stubAuth{"alice", "pw"}, source)
-	_, err := h.Resolve(context.Background(), &Request{Sub: "alice", Password: "wrong"})
+	ctx := WithSub(context.Background(), "alice")
+	ctx = WithPassword(ctx, "wrong")
+	_, err := h.Resolve(ctx, &Request{})
 	if err == nil {
 		t.Fatal("expected error for wrong password")
 	}
