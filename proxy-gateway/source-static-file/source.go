@@ -8,14 +8,12 @@ import (
 	"proxy-gateway/core"
 )
 
-// Source is a proxy source backed by a fixed list loaded from a text file at startup.
-// Endpoint selection uses a least-used counter with random tie-breaking.
+// Source is a proxy source backed by a fixed list loaded from a text file.
 type Source struct {
-	pool        *core.CountingPool[core.SourceProxy]
+	pool        *core.CountingPool[core.Proxy]
 	pathDisplay string
 }
 
-// Load creates a StaticFileSource from the given path and format.
 func Load(path string, format core.ProxyFormat) (*Source, error) {
 	if format == "" {
 		format = core.DefaultProxyFormat
@@ -33,8 +31,7 @@ func Load(path string, format core.ProxyFormat) (*Source, error) {
 	}, nil
 }
 
-// BuildSource constructs a Source from config, resolving relative paths against configDir.
-func BuildSource(cfg *Config, configDir string) (core.ProxySource, error) {
+func BuildSource(cfg *Config, configDir string) (*Source, error) {
 	path := cfg.ProxiesFile
 	if !filepath.IsAbs(path) {
 		path = filepath.Join(configDir, path)
@@ -42,24 +39,11 @@ func BuildSource(cfg *Config, configDir string) (core.ProxySource, error) {
 	return Load(path, cfg.Format)
 }
 
-func (s *Source) GetSourceProxy(_ context.Context, _ core.AffinityParams) (*core.SourceProxy, error) {
+// Resolve implements core.Handler — returns the least-used proxy.
+func (s *Source) Resolve(_ context.Context, _ *core.Request) (*core.Proxy, error) {
 	p := s.pool.Next()
 	if p == nil {
-		return nil, nil
-	}
-	cp := *p
-	return &cp, nil
-}
-
-func (s *Source) GetSourceProxyForceRotate(_ context.Context, _ core.AffinityParams, current *core.SourceProxy) (*core.SourceProxy, error) {
-	p := s.pool.NextExcluding(func(sp core.SourceProxy) bool {
-		if current == nil {
-			return false
-		}
-		return sp.Equal(*current)
-	})
-	if p == nil {
-		return nil, nil
+		return nil, fmt.Errorf("empty proxy pool")
 	}
 	cp := *p
 	return &cp, nil

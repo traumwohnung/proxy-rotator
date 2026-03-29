@@ -1,22 +1,18 @@
-// Package gateway provides a minimal HTTP proxy server that tunnels traffic
-// through upstream proxies managed by a core.SessionStore.
+// Package gateway provides an HTTP proxy server (CONNECT + plain HTTP)
+// that delegates proxy resolution to a core.Handler pipeline.
 //
-// There is no REST API and no configuration file loading. Callers construct
-// a SessionStore and an AuthProvider programmatically and hand them to Run.
+// Usage:
 //
-// Example:
-//
-//	store := core.NewSessionStore([]core.ProxySet{
-//	    {Name: "residential", Source: mySource},
-//	})
-//	core.SpawnSessionCleanup(store)
-//	auth := simple.New("alice", "s3cret")
-//	log.Fatal(gateway.Run(":8100", store, auth))
+//	pipeline := middleware.Auth(myAuth,
+//	    middleware.Sticky(sources.StaticFile("proxies.txt")),
+//	)
+//	gateway.Run(":8100", pipeline)
 package gateway
 
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -30,20 +26,20 @@ import (
 	"proxy-gateway/core"
 )
 
-// Run starts the proxy server on addr and blocks until it returns an error.
-func Run(addr string, store *core.SessionStore, auth core.AuthProvider) error {
+// Run starts the HTTP proxy server and blocks.
+func Run(addr string, handler core.Handler) error {
 	slog.Info("proxy gateway listening", "addr", addr)
-	slog.Info("available proxy sets", "sets", store.SetNames())
-	return http.ListenAndServe(addr, Handler(store, auth))
+	return http.ListenAndServe(addr, HTTPHandler(handler))
 }
 
-// Handler returns the http.Handler for the proxy server so callers can embed
-// it inside a larger http.Server (e.g. to set timeouts or TLS).
-func Handler(store *core.SessionStore, auth core.AuthProvider) http.Handler {
+// HTTPHandler returns an http.Handler that serves proxy requests.
+// It parses the Proxy-Authorization header to build a core.Request,
+// calls handler.Resolve, and tunnels through the returned Proxy.
+func HTTPHandler(handler core.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		clientIP, _, _ := net.SplitHostPort(r.RemoteAddr)
 
-		result, err := parseAndAuthenticate(r.Header.Get("Proxy-Authorization"), auth, store.SetNames())
+		req, err := parseBasicAuth(r.Header.Get("Proxy-Authorization"))
 		if err != nil {
 			slog.Warn("auth error", "method", r.Method, "uri", r.RequestURI, "client", clientIP, "err", err)
 			w.Header().Set("Proxy-Authenticate", `Basic realm="proxy-gateway"`)
@@ -51,48 +47,102 @@ func Handler(store *core.SessionStore, auth core.AuthProvider) http.Handler {
 			return
 		}
 
-		upstream, err := store.NextProxy(r.Context(), result.SetName, result.AffinityMinutes, result.UsernameB64, result.AffinityParams)
-		if err != nil || upstream == nil {
-			slog.Warn("unknown proxy set", "set", result.SetName)
-			http.Error(w,
-				fmt.Sprintf("Unknown proxy set '%s'. Available: %v", result.SetName, store.SetNames()),
-				http.StatusBadRequest)
+		proxy, err := handler.Resolve(r.Context(), req)
+		if err != nil {
+			slog.Warn("resolve error", "sub", req.Sub, "set", req.Set, "err", err)
+			http.Error(w, err.Error(), http.StatusForbidden)
+			return
+		}
+		if proxy == nil {
+			http.Error(w, "no proxy available", http.StatusServiceUnavailable)
 			return
 		}
 
-		slog.Info("routing request",
+		slog.Info("routing",
 			"method", r.Method,
 			"uri", r.RequestURI,
-			"set", result.SetName,
-			"minutes", result.AffinityMinutes,
-			"upstream", fmt.Sprintf("%s:%d", upstream.Host, upstream.Port),
+			"sub", req.Sub,
+			"set", req.Set,
+			"upstream", fmt.Sprintf("%s:%d", proxy.Host, proxy.Port),
 			"client", clientIP,
 		)
 
-		// Open a connection handle if the auth provider implements ConnectionTracker.
+		// Check if the handler (or any wrapper) implements ConnectionTracker.
 		var handle core.ConnHandle
-		if tracker, ok := auth.(core.ConnectionTracker); ok {
-			handle, err = tracker.OpenConnection(result.Sub)
+		if tracker, ok := handler.(core.ConnectionTracker); ok {
+			handle, err = tracker.OpenConnection(req.Sub)
 			if err != nil {
-				slog.Warn("connection rejected by tracker", "sub", result.Sub, "err", err)
+				slog.Warn("connection rejected", "sub", req.Sub, "err", err)
 				http.Error(w, err.Error(), http.StatusTooManyRequests)
 				return
 			}
 		}
 
 		if r.Method == http.MethodConnect {
-			serveConnect(w, r, upstream, handle)
+			serveConnect(w, r, proxy, handle)
 		} else {
-			serveHTTP(w, r, upstream, handle)
+			serveHTTP(w, r, proxy, handle)
 		}
 	})
+}
+
+// ---------------------------------------------------------------------------
+// Basic auth → core.Request
+// ---------------------------------------------------------------------------
+
+func parseBasicAuth(headerVal string) (*core.Request, error) {
+	b64, ok := strings.CutPrefix(headerVal, "Basic ")
+	if !ok {
+		return nil, fmt.Errorf("Proxy-Authorization must use Basic scheme")
+	}
+	decoded, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil {
+		return nil, fmt.Errorf("invalid base64 in Proxy-Authorization")
+	}
+
+	raw := string(decoded)
+	colonIdx := strings.LastIndex(raw, ":")
+	if colonIdx < 0 {
+		return nil, fmt.Errorf("invalid Basic credentials: missing colon separator")
+	}
+	usernameJSON := raw[:colonIdx]
+	password := raw[colonIdx+1:]
+	if usernameJSON == "" {
+		return nil, fmt.Errorf("empty username in Proxy-Authorization")
+	}
+
+	// Parse the JSON username: {"sub":"...", "set":"...", "minutes":N, "meta":{...}}
+	var parsed struct {
+		Sub     string                 `json:"sub"`
+		Set     string                 `json:"set"`
+		Minutes int                    `json:"minutes"`
+		Meta    map[string]interface{} `json:"meta"`
+	}
+	if err := json.Unmarshal([]byte(usernameJSON), &parsed); err != nil {
+		return nil, fmt.Errorf("username is not valid JSON: %w", err)
+	}
+	if parsed.Sub == "" {
+		return nil, fmt.Errorf("'sub' must not be empty")
+	}
+	if parsed.Set == "" {
+		return nil, fmt.Errorf("'set' must not be empty")
+	}
+
+	return &core.Request{
+		Sub:        parsed.Sub,
+		Password:   password,
+		Set:        parsed.Set,
+		Meta:       core.Meta(parsed.Meta),
+		SessionKey: b64, // stable key for affinity
+		SessionTTL: parsed.Minutes,
+	}, nil
 }
 
 // ---------------------------------------------------------------------------
 // CONNECT tunnel
 // ---------------------------------------------------------------------------
 
-func serveConnect(w http.ResponseWriter, r *http.Request, upstream *core.ResolvedProxy, handle core.ConnHandle) {
+func serveConnect(w http.ResponseWriter, r *http.Request, proxy *core.Proxy, handle core.ConnHandle) {
 	hj, ok := w.(http.Hijacker)
 	if !ok {
 		http.Error(w, "hijacking not supported", http.StatusInternalServerError)
@@ -112,7 +162,7 @@ func serveConnect(w http.ResponseWriter, r *http.Request, upstream *core.Resolve
 	}
 	defer conn.Close()
 
-	sent, received, err := connectTunnel(conn, r.Host, upstream, handle)
+	sent, received, err := connectTunnel(conn, r.Host, proxy, handle)
 	if handle != nil {
 		handle.Close(sent, received)
 	}
@@ -121,27 +171,26 @@ func serveConnect(w http.ResponseWriter, r *http.Request, upstream *core.Resolve
 	}
 }
 
-func connectTunnel(clientConn net.Conn, target string, upstream *core.ResolvedProxy, handle core.ConnHandle) (sent, received int64, err error) {
-	upstreamConn, err := net.Dial("tcp", hostPort(upstream.Host, upstream.Port))
+func connectTunnel(clientConn net.Conn, target string, proxy *core.Proxy, handle core.ConnHandle) (sent, received int64, err error) {
+	upstreamAddr := hostPort(proxy.Host, proxy.Port)
+	upstreamConn, err := net.Dial("tcp", upstreamAddr)
 	if err != nil {
-		return 0, 0, fmt.Errorf("connecting to upstream %s: %w", hostPort(upstream.Host, upstream.Port), err)
+		return 0, 0, fmt.Errorf("connecting to upstream %s: %w", upstreamAddr, err)
 	}
 	defer upstreamConn.Close()
 
-	// Send CONNECT to upstream.
+	// CONNECT handshake with upstream.
 	req := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n", target, target)
-	if proxyAuth := upstreamProxyAuth(upstream); proxyAuth != "" {
-		req += "Proxy-Authorization: " + proxyAuth + "\r\n"
+	if proxy.Username != "" {
+		req += "Proxy-Authorization: Basic " + base64.StdEncoding.EncodeToString(
+			[]byte(proxy.Username+":"+proxy.Password)) + "\r\n"
 	}
 	req += "\r\n"
 	if _, err = fmt.Fprint(upstreamConn, req); err != nil {
 		return 0, 0, fmt.Errorf("sending CONNECT: %w", err)
 	}
 
-	// Read the full CONNECT response (loop until \r\n\r\n).
-	// Some upstream proxies send the status line and headers in separate TCP
-	// packets. A single Read() would only get the first packet and miss the
-	// terminal \r\n\r\n, corrupting the subsequent TLS handshake.
+	// Read full CONNECT response (loop until \r\n\r\n).
 	var respBuf []byte
 	tmp := make([]byte, 1024)
 	for {
@@ -152,7 +201,6 @@ func connectTunnel(clientConn net.Conn, target string, upstream *core.ResolvedPr
 		if readErr != nil {
 			return 0, 0, fmt.Errorf("reading CONNECT response: %w", readErr)
 		}
-		// Check for end of headers.
 		for i := 0; i+3 < len(respBuf); i++ {
 			if respBuf[i] == '\r' && respBuf[i+1] == '\n' && respBuf[i+2] == '\r' && respBuf[i+3] == '\n' {
 				goto gotResponse
@@ -165,17 +213,15 @@ gotResponse:
 		return 0, 0, fmt.Errorf("upstream rejected CONNECT: %s", resp)
 	}
 
-	// Build a cancellable context so either goroutine can tear down both sides.
+	// Cancellable relay with optional traffic counting.
 	_, cancel := context.WithCancel(context.Background())
 	defer cancel()
-
 	cancelConn := func() {
 		cancel()
 		_ = clientConn.SetDeadline(immediateDeadline())
 		_ = upstreamConn.SetDeadline(immediateDeadline())
 	}
 
-	// Wrap connections with counting readers that feed RecordTraffic.
 	var clientReader io.Reader = clientConn
 	var upstreamReader io.Reader = upstreamConn
 	if handle != nil {
@@ -183,26 +229,25 @@ gotResponse:
 		upstreamReader = &countingReader{r: upstreamConn, upstream: false, handle: handle, cancel: cancelConn}
 	}
 
-	type relayResult struct {
+	type result struct {
 		n   int64
 		err error
 	}
-	sentCh := make(chan relayResult, 1)
-	recvCh := make(chan relayResult, 1)
-
+	sentCh := make(chan result, 1)
+	recvCh := make(chan result, 1)
 	go func() {
 		n, err := io.Copy(upstreamConn, clientReader)
 		if tc, ok := upstreamConn.(*net.TCPConn); ok {
 			_ = tc.CloseWrite()
 		}
-		sentCh <- relayResult{n, err}
+		sentCh <- result{n, err}
 	}()
 	go func() {
 		n, err := io.Copy(clientConn, upstreamReader)
 		if tc, ok := clientConn.(*net.TCPConn); ok {
 			_ = tc.CloseWrite()
 		}
-		recvCh <- relayResult{n, err}
+		recvCh <- result{n, err}
 	}()
 
 	sr := <-sentCh
@@ -214,7 +259,7 @@ gotResponse:
 // Plain HTTP forwarding
 // ---------------------------------------------------------------------------
 
-func serveHTTP(w http.ResponseWriter, r *http.Request, upstream *core.ResolvedProxy, handle core.ConnHandle) {
+func serveHTTP(w http.ResponseWriter, r *http.Request, proxy *core.Proxy, handle core.ConnHandle) {
 	var headers []string
 	for name, values := range r.Header {
 		if isHopByHop(name) {
@@ -224,13 +269,12 @@ func serveHTTP(w http.ResponseWriter, r *http.Request, upstream *core.ResolvedPr
 			headers = append(headers, name+": "+v)
 		}
 	}
-
 	uri := r.RequestURI
 	if !strings.HasPrefix(uri, "http://") && !strings.HasPrefix(uri, "https://") {
 		uri = "http://" + r.Host + uri
 	}
 
-	raw, err := ForwardHTTP(r.Method, uri, headers, r.Body, upstream)
+	raw, err := ForwardHTTP(r.Method, uri, headers, r.Body, proxy)
 
 	if handle != nil {
 		var reqBytes int64
@@ -247,12 +291,11 @@ func serveHTTP(w http.ResponseWriter, r *http.Request, upstream *core.ResolvedPr
 		http.Error(w, "upstream error: "+err.Error(), http.StatusBadGateway)
 		return
 	}
-
 	writeRawResponse(w, raw)
 }
 
 // ---------------------------------------------------------------------------
-// countingReader
+// Helpers
 // ---------------------------------------------------------------------------
 
 type countingReader struct {
@@ -270,10 +313,6 @@ func (cr *countingReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
 func writeRawResponse(w http.ResponseWriter, raw []byte) {
 	headerEnd := len(raw)
 	for i := 0; i+4 <= len(raw); i++ {
@@ -286,13 +325,11 @@ func writeRawResponse(w http.ResponseWriter, raw []byte) {
 	if bodyStart > len(raw) {
 		bodyStart = len(raw)
 	}
-
 	lines := strings.Split(string(raw[:headerEnd]), "\r\n")
 	if len(lines) == 0 {
 		w.WriteHeader(http.StatusBadGateway)
 		return
 	}
-
 	statusCode := http.StatusBadGateway
 	if parts := strings.SplitN(lines[0], " ", 3); len(parts) >= 2 {
 		if code, err := strconv.Atoi(parts[1]); err == nil {
@@ -306,17 +343,6 @@ func writeRawResponse(w http.ResponseWriter, raw []byte) {
 	}
 	w.WriteHeader(statusCode)
 	_, _ = w.Write(raw[bodyStart:])
-}
-
-func upstreamProxyAuth(upstream *core.ResolvedProxy) string {
-	if upstream.Username == nil {
-		return ""
-	}
-	pass := ""
-	if upstream.Password != nil {
-		pass = *upstream.Password
-	}
-	return "Basic " + base64.StdEncoding.EncodeToString([]byte(*upstream.Username+":"+pass))
 }
 
 func hostPort(host string, port uint16) string {
@@ -335,53 +361,4 @@ func isHopByHop(header string) bool {
 	return false
 }
 
-func immediateDeadline() time.Time {
-	return time.Unix(0, 1)
-}
-
-// ---------------------------------------------------------------------------
-// Auth parsing
-// ---------------------------------------------------------------------------
-
-func parseAndAuthenticate(headerVal string, auth core.AuthProvider, availableSets []string) (*core.AuthResult, error) {
-	b64, ok := strings.CutPrefix(headerVal, "Basic ")
-	if !ok {
-		return nil, fmt.Errorf(
-			"Proxy-Authorization must use Basic scheme. Expected: Basic base64({\"sub\":\"<user>\",\"set\":\"<proxyset>\",\"minutes\":<0-1440>,\"meta\":{...}}:<password>). Available sets: %v",
-			availableSets,
-		)
-	}
-	decoded, err := base64.StdEncoding.DecodeString(b64)
-	if err != nil {
-		return nil, fmt.Errorf("invalid base64 in Proxy-Authorization")
-	}
-
-	raw := string(decoded)
-	colonIdx := strings.LastIndex(raw, ":")
-	if colonIdx < 0 {
-		return nil, fmt.Errorf("invalid Basic credentials: missing colon separator")
-	}
-	usernameJSON := raw[:colonIdx]
-	password := raw[colonIdx+1:]
-
-	if usernameJSON == "" {
-		return nil, fmt.Errorf("empty username in Proxy-Authorization")
-	}
-
-	parsed, err := core.ParseUsernameJSON(usernameJSON)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := auth.Authenticate(parsed.Sub, password); err != nil {
-		return nil, err
-	}
-
-	return &core.AuthResult{
-		Sub:             parsed.Sub,
-		SetName:         parsed.SetName,
-		AffinityMinutes: parsed.AffinityMinutes,
-		UsernameB64:     b64,
-		AffinityParams:  parsed.AffinityParams,
-	}, nil
-}
+func immediateDeadline() time.Time { return time.Unix(0, 1) }

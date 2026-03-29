@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"encoding/base64"
 	"fmt"
 	"io"
 	"net"
@@ -8,13 +9,11 @@ import (
 	"proxy-gateway/core"
 )
 
-// ForwardHTTP sends a plain HTTP request through an upstream proxy and returns
-// the raw response bytes. Exported for use by callers that need to make
-// out-of-band requests through a proxy (e.g. the verify endpoint).
-func ForwardHTTP(method, uri string, headers []string, body io.Reader, upstream *core.ResolvedProxy) ([]byte, error) {
-	conn, err := net.Dial("tcp", hostPort(upstream.Host, upstream.Port))
+// ForwardHTTP sends a plain HTTP request through an upstream proxy.
+func ForwardHTTP(method, uri string, headers []string, body io.Reader, proxy *core.Proxy) ([]byte, error) {
+	conn, err := net.Dial("tcp", hostPort(proxy.Host, proxy.Port))
 	if err != nil {
-		return nil, fmt.Errorf("connecting to upstream %s: %w", hostPort(upstream.Host, upstream.Port), err)
+		return nil, fmt.Errorf("connecting to upstream %s: %w", hostPort(proxy.Host, proxy.Port), err)
 	}
 	defer conn.Close()
 
@@ -22,8 +21,9 @@ func ForwardHTTP(method, uri string, headers []string, body io.Reader, upstream 
 	for _, h := range headers {
 		req += h + "\r\n"
 	}
-	if auth := upstreamProxyAuth(upstream); auth != "" {
-		req += "Proxy-Authorization: " + auth + "\r\n"
+	if proxy.Username != "" {
+		creds := base64.StdEncoding.EncodeToString([]byte(proxy.Username + ":" + proxy.Password))
+		req += "Proxy-Authorization: Basic " + creds + "\r\n"
 	}
 	req += "\r\n"
 
@@ -35,6 +35,5 @@ func ForwardHTTP(method, uri string, headers []string, body io.Reader, upstream 
 			return nil, err
 		}
 	}
-
 	return io.ReadAll(conn)
 }

@@ -5,8 +5,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-
-	"proxy-gateway/core"
 )
 
 func main() {
@@ -37,27 +35,18 @@ func main() {
 		configDir = "."
 	}
 
-	proxySets, err := BuildProxySets(cfg, configDir)
+	pipeline, sessions, err := BuildPipeline(cfg, configDir)
 	if err != nil {
-		slog.Error("failed to build proxy sets", "err", err)
+		slog.Error("failed to build pipeline", "err", err)
 		os.Exit(1)
 	}
 
-	for _, ps := range proxySets {
-		slog.Info("loaded proxy set", "name", ps.Name, "source", ps.Source.Describe())
+	if sessions != nil {
+		sessions.SpawnCleanup()
 	}
 
-	auth, err := BuildAuthProvider(cfg)
-	if err != nil {
-		slog.Error("failed to build auth provider", "err", err)
-		os.Exit(1)
-	}
-
-	store := core.NewSessionStore(proxySets)
-	core.SpawnSessionCleanup(store)
-
-	if err := RunServer(cfg.BindAddr, store, auth, APIKey()); err != nil {
-		slog.Error("proxy server error", "err", err)
+	if err := RunServer(cfg.BindAddr, pipeline, sessions, os.Getenv("API_KEY")); err != nil {
+		slog.Error("server error", "err", err)
 		os.Exit(1)
 	}
 }

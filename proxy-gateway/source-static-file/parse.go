@@ -9,15 +9,14 @@ import (
 	"proxy-gateway/core"
 )
 
-// LoadProxies reads a proxies file and parses each non-empty, non-comment line.
-func LoadProxies(path string, format core.ProxyFormat) ([]core.SourceProxy, error) {
+func LoadProxies(path string, format core.ProxyFormat) ([]core.Proxy, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("reading %s: %w", path, err)
 	}
 	defer f.Close()
 
-	var proxies []core.SourceProxy
+	var proxies []core.Proxy
 	scanner := bufio.NewScanner(f)
 	lineNum := 0
 	for scanner.Scan() {
@@ -32,8 +31,5 @@ func LoadProxies(path string, format core.ProxyFormat) ([]core.SourceProxy, erro
 		}
 		proxies = append(proxies, p)
 	}
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("reading %s: %w", path, err)
-	}
-	return proxies, nil
+	return proxies, scanner.Err()
 }

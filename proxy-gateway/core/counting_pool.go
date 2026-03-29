@@ -2,8 +2,7 @@ package core
 
 import "sync/atomic"
 
-// CountingPool is a fixed-size pool of items with atomic usage counters.
-// Next always returns the item with the lowest use-count, breaking ties randomly.
+// CountingPool is a fixed-size pool with least-used selection.
 type CountingPool[T any] struct {
 	entries []poolEntry[T]
 }
@@ -13,7 +12,6 @@ type poolEntry[T any] struct {
 	useCount atomic.Uint64
 }
 
-// NewCountingPool creates a pool from a slice of items.
 func NewCountingPool[T any](items []T) *CountingPool[T] {
 	entries := make([]poolEntry[T], len(items))
 	for i, v := range items {
@@ -22,14 +20,9 @@ func NewCountingPool[T any](items []T) *CountingPool[T] {
 	return &CountingPool[T]{entries: entries}
 }
 
-// Len returns the number of items in the pool.
-func (p *CountingPool[T]) Len() int { return len(p.entries) }
-
-// IsEmpty returns true if the pool has no items.
+func (p *CountingPool[T]) Len() int      { return len(p.entries) }
 func (p *CountingPool[T]) IsEmpty() bool { return len(p.entries) == 0 }
 
-// Next returns a pointer to the least-used item and increments its counter.
-// Returns nil if the pool is empty.
 func (p *CountingPool[T]) Next() *T {
 	if len(p.entries) == 0 {
 		return nil
@@ -39,20 +32,16 @@ func (p *CountingPool[T]) Next() *T {
 	return &p.entries[idx].value
 }
 
-// NextExcluding is like Next but tries to avoid returning the item for which
-// equal(item) returns true. Falls back to Next if all items match.
 func (p *CountingPool[T]) NextExcluding(equal func(T) bool) *T {
 	if len(p.entries) == 0 {
 		return nil
 	}
-
 	var nonExcluded []int
 	for i := range p.entries {
 		if !equal(p.entries[i].value) {
 			nonExcluded = append(nonExcluded, i)
 		}
 	}
-
 	var idx int
 	if len(nonExcluded) == 0 {
 		idx = pickLeastUsed(p.entries)

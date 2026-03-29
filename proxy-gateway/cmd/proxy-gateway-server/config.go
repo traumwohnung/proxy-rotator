@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -11,7 +12,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"proxy-gateway/core"
-	simple "proxy-gateway/auth-simple"
+	"proxy-gateway/middleware"
 	bottingtools "proxy-gateway/source-bottingtools"
 	geonode "proxy-gateway/source-geonode"
 	staticfile "proxy-gateway/source-static-file"
@@ -20,7 +21,6 @@ import (
 type Config struct {
 	BindAddr     string        `toml:"bind_addr"      yaml:"bind_addr"      json:"bind_addr"`
 	LogLevel     string        `toml:"log_level"      yaml:"log_level"      json:"log_level"`
-	AuthType     string        `toml:"auth_type"      yaml:"auth_type"      json:"auth_type"`
 	AuthSub      string        `toml:"auth_sub"       yaml:"auth_sub"       json:"auth_sub"`
 	AuthPassword string        `toml:"auth_password"  yaml:"auth_password"  json:"auth_password"`
 	ProxySets    []ProxySetRaw `toml:"proxy_set"      yaml:"proxy_set"      json:"proxy_set"`
@@ -32,67 +32,61 @@ type ProxySetRaw struct {
 	Source     map[string]interface{} `toml:"source"      yaml:"source"      json:"source"`
 }
 
-// LoadConfig reads and parses a config file.
-// Format is detected from file extension: .toml (default), .yaml/.yml, .json.
 func LoadConfig(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("reading config %s: %w", path, err)
 	}
-
-	cfg := &Config{
-		BindAddr: "127.0.0.1:8100",
-		LogLevel: "info",
-	}
-
+	cfg := &Config{BindAddr: "127.0.0.1:8100", LogLevel: "info"}
 	switch strings.ToLower(filepath.Ext(path)) {
 	case ".yaml", ".yml":
-		if err := yaml.Unmarshal(data, cfg); err != nil {
-			return nil, fmt.Errorf("parsing config %s: %w", path, err)
-		}
+		err = yaml.Unmarshal(data, cfg)
 	case ".json":
-		if err := json.Unmarshal(data, cfg); err != nil {
-			return nil, fmt.Errorf("parsing config %s: %w", path, err)
-		}
+		err = json.Unmarshal(data, cfg)
 	default:
-		if err := toml.Unmarshal(data, cfg); err != nil {
-			return nil, fmt.Errorf("parsing config %s: %w", path, err)
-		}
+		err = toml.Unmarshal(data, cfg)
 	}
-
+	if err != nil {
+		return nil, fmt.Errorf("parsing config %s: %w", path, err)
+	}
 	return cfg, nil
 }
 
-// BuildAuthProvider constructs the configured AuthProvider.
-// auth_type "simple" (default) requires auth_sub and auth_password.
-func BuildAuthProvider(cfg *Config) (core.AuthProvider, error) {
-	switch cfg.AuthType {
-	case "", "simple":
-		if cfg.AuthSub == "" {
-			return nil, fmt.Errorf("auth_type \"simple\" requires auth_sub to be set")
-		}
-		if cfg.AuthPassword == "" {
-			return nil, fmt.Errorf("auth_type \"simple\" requires auth_password to be set")
-		}
-		return simple.New(cfg.AuthSub, cfg.AuthPassword), nil
-	default:
-		return nil, fmt.Errorf("unknown auth_type %q (supported: simple)", cfg.AuthType)
+// BuildPipeline constructs the full handler pipeline from config.
+// Returns the pipeline, the sticky session handler (for API introspection), and any error.
+func BuildPipeline(cfg *Config, configDir string) (core.Handler, *middleware.StickyHandler, error) {
+	if cfg.AuthSub == "" || cfg.AuthPassword == "" {
+		return nil, nil, fmt.Errorf("auth_sub and auth_password are required")
 	}
-}
 
-func BuildProxySets(cfg *Config, configDir string) ([]core.ProxySet, error) {
-	var sets []core.ProxySet
+	// Build a handler that routes by set name to the right source.
+	sources := make(map[string]core.Handler)
 	for _, raw := range cfg.ProxySets {
 		src, err := buildSource(raw.SourceType, raw.Source, configDir)
 		if err != nil {
-			return nil, fmt.Errorf("proxy set %q (type %q): %w", raw.Name, raw.SourceType, err)
+			return nil, nil, fmt.Errorf("proxy set %q: %w", raw.Name, err)
 		}
-		sets = append(sets, core.ProxySet{Name: raw.Name, Source: src})
+		sources[raw.Name] = src
 	}
-	return sets, nil
+
+	router := core.HandlerFunc(func(ctx context.Context, req *core.Request) (*core.Proxy, error) {
+		h, ok := sources[req.Set]
+		if !ok {
+			return nil, fmt.Errorf("unknown proxy set %q", req.Set)
+		}
+		return h.Resolve(ctx, req)
+	})
+
+	sticky := middleware.Sticky(router)
+	auth := middleware.Auth(
+		middleware.NewSimpleAuth(cfg.AuthSub, cfg.AuthPassword),
+		sticky,
+	)
+
+	return auth, sticky, nil
 }
 
-func buildSource(sourceType string, rawSource map[string]interface{}, configDir string) (core.ProxySource, error) {
+func buildSource(sourceType string, rawSource map[string]interface{}, configDir string) (core.Handler, error) {
 	jsonBytes, err := json.Marshal(normalizeMap(rawSource))
 	if err != nil {
 		return nil, fmt.Errorf("re-encoding source config: %w", err)
@@ -103,7 +97,7 @@ func buildSource(sourceType string, rawSource map[string]interface{}, configDir 
 		var cfg staticfile.Config
 		cfg.Format = core.DefaultProxyFormat
 		if err := json.Unmarshal(jsonBytes, &cfg); err != nil {
-			return nil, fmt.Errorf("invalid static_file source config: %w", err)
+			return nil, fmt.Errorf("invalid static_file config: %w", err)
 		}
 		return staticfile.BuildSource(&cfg, configDir)
 
@@ -115,24 +109,22 @@ func buildSource(sourceType string, rawSource map[string]interface{}, configDir 
 			Product     bottingtools.RawProductConfig `json:"product"`
 		}
 		if err := json.Unmarshal(jsonBytes, &rawCfg); err != nil {
-			return nil, fmt.Errorf("invalid bottingtools source config: %w", err)
+			return nil, fmt.Errorf("invalid bottingtools config: %w", err)
 		}
 		product, err := bottingtools.ParseProductConfig(rawCfg.Product)
 		if err != nil {
 			return nil, err
 		}
 		return bottingtools.BuildSource(&bottingtools.Config{
-			Username:    rawCfg.Username,
-			PasswordEnv: rawCfg.PasswordEnv,
-			Host:        rawCfg.Host,
-			Product:     product,
+			Username: rawCfg.Username, PasswordEnv: rawCfg.PasswordEnv,
+			Host: rawCfg.Host, Product: product,
 		})
 
 	case "geonode":
 		var cfg geonode.Config
 		cfg.Protocol = geonode.GeonodeProtocolHTTP
 		if err := json.Unmarshal(jsonBytes, &cfg); err != nil {
-			return nil, fmt.Errorf("invalid geonode source config: %w", err)
+			return nil, fmt.Errorf("invalid geonode config: %w", err)
 		}
 		if cfg.Session.Type == "" {
 			cfg.Session.Type = geonode.SessionTypeRotating
@@ -140,7 +132,7 @@ func buildSource(sourceType string, rawSource map[string]interface{}, configDir 
 		return geonode.BuildSource(&cfg)
 
 	default:
-		return nil, fmt.Errorf("unknown source type %q (supported: static_file, bottingtools, geonode)", sourceType)
+		return nil, fmt.Errorf("unknown source type %q", sourceType)
 	}
 }
 
@@ -166,8 +158,4 @@ func normalizeMap(v interface{}) interface{} {
 	default:
 		return val
 	}
-}
-
-func apiKeyFromEnv() string {
-	return os.Getenv("API_KEY")
 }
