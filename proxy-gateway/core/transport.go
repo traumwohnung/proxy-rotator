@@ -11,6 +11,13 @@ type Downstream interface {
 	Serve(addr string, handler Handler) error
 }
 
+// UpstreamAware is an optional interface for Downstream implementations
+// that need an Upstream dialer injected by the Gateway. The Gateway calls
+// SetUpstream before calling Serve.
+type UpstreamAware interface {
+	SetUpstream(u Upstream)
+}
+
 // Upstream dials a target through an upstream proxy.
 type Upstream interface {
 	Dial(ctx context.Context, proxy *Proxy, target string) (net.Conn, error)

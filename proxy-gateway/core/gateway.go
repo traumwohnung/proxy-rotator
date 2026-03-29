@@ -56,12 +56,9 @@ func (g *Gateway) ListenAndServe() error {
 	var wg sync.WaitGroup
 
 	for _, l := range g.listeners {
-		// Inject our upstream into downstreams that support it.
-		switch d := l.downstream.(type) {
-		case *HTTPDownstream:
-			d.Upstream = g.upstream
-		case *SOCKS5Downstream:
-			d.Upstream = g.upstream
+		// Inject upstream into any downstream that supports it.
+		if ua, ok := l.downstream.(UpstreamAware); ok {
+			ua.SetUpstream(g.upstream)
 		}
 
 		wg.Add(1)

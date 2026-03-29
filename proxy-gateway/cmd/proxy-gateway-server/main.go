@@ -41,10 +41,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	if sessions != nil {
-		sessions.SpawnCleanup()
-	}
-
 	if err := RunServer(cfg, pipeline, sessions, os.Getenv("API_KEY")); err != nil {
 		slog.Error("server error", "err", err)
 		os.Exit(1)

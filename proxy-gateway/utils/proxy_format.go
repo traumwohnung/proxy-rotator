@@ -1,9 +1,11 @@
-package core
+package utils
 
 import (
 	"fmt"
 	"strconv"
 	"strings"
+
+	"proxy-gateway/core"
 )
 
 type ProxyFormat string
@@ -15,7 +17,7 @@ const (
 	DefaultProxyFormat                        = ProxyFormatHostPortUserPass
 )
 
-func ParseProxyLine(s string, format ProxyFormat) (Proxy, error) {
+func ParseProxyLine(s string, format ProxyFormat) (core.Proxy, error) {
 	s = stripProtocol(s)
 	switch format {
 	case ProxyFormatUserPassAtHostPort:
@@ -34,29 +36,29 @@ func stripProtocol(s string) string {
 	return s
 }
 
-func parseUserPassAtHostPort(s string) (Proxy, error) {
+func parseUserPassAtHostPort(s string) (core.Proxy, error) {
 	at := strings.LastIndex(s, "@")
 	if at < 0 {
 		host, port, err := parseHostPort(s)
 		if err != nil {
-			return Proxy{}, err
+			return core.Proxy{}, err
 		}
-		return Proxy{Host: host, Port: port}, nil
+		return core.Proxy{Host: host, Port: port}, nil
 	}
 	creds := s[:at]
 	hostPort := s[at+1:]
 	host, port, err := parseHostPort(hostPort)
 	if err != nil {
-		return Proxy{}, err
+		return core.Proxy{}, err
 	}
 	user, pass, err := splitUserPass(creds)
 	if err != nil {
-		return Proxy{}, err
+		return core.Proxy{}, err
 	}
-	return Proxy{Host: host, Port: port, Username: user, Password: pass}, nil
+	return core.Proxy{Host: host, Port: port, Username: user, Password: pass}, nil
 }
 
-func parseUserPassHostPort(s string) (Proxy, error) {
+func parseUserPassHostPort(s string) (core.Proxy, error) {
 	parts := rSplitN(s, ':', 3)
 	if len(parts) == 3 {
 		if port, err := strconv.ParseUint(parts[2], 10, 16); err == nil {
@@ -66,28 +68,28 @@ func parseUserPassHostPort(s string) (Proxy, error) {
 				user := creds[:ci]
 				pass := creds[ci+1:]
 				if user != "" {
-					return Proxy{Host: host, Port: uint16(port), Username: user, Password: pass}, nil
+					return core.Proxy{Host: host, Port: uint16(port), Username: user, Password: pass}, nil
 				}
 			}
 		}
 	}
 	host, port, err := parseHostPort(s)
 	if err != nil {
-		return Proxy{}, fmt.Errorf("expected user:pass:host:port or host:port, got %q", s)
+		return core.Proxy{}, fmt.Errorf("expected user:pass:host:port or host:port, got %q", s)
 	}
-	return Proxy{Host: host, Port: port}, nil
+	return core.Proxy{Host: host, Port: port}, nil
 }
 
-func parseHostPortUserPass(s string) (Proxy, error) {
+func parseHostPortUserPass(s string) (core.Proxy, error) {
 	if strings.HasPrefix(s, "[") {
 		end := strings.Index(s, "]")
 		if end < 0 {
-			return Proxy{}, fmt.Errorf("unclosed bracket in %q", s)
+			return core.Proxy{}, fmt.Errorf("unclosed bracket in %q", s)
 		}
 		host := s[1:end]
 		rest := s[end+1:]
 		if !strings.HasPrefix(rest, ":") {
-			return Proxy{}, fmt.Errorf("expected ':' after ']' in %q", s)
+			return core.Proxy{}, fmt.Errorf("expected ':' after ']' in %q", s)
 		}
 		return parsePortAndOptionalCreds(host, rest[1:])
 	}
@@ -96,37 +98,37 @@ func parseHostPortUserPass(s string) (Proxy, error) {
 	case 2:
 		port, err := strconv.ParseUint(parts[1], 10, 16)
 		if err != nil {
-			return Proxy{}, fmt.Errorf("invalid port in %q", s)
+			return core.Proxy{}, fmt.Errorf("invalid port in %q", s)
 		}
-		return Proxy{Host: parts[0], Port: uint16(port)}, nil
+		return core.Proxy{Host: parts[0], Port: uint16(port)}, nil
 	case 4:
 		port, err := strconv.ParseUint(parts[1], 10, 16)
 		if err != nil {
-			return Proxy{}, fmt.Errorf("invalid port in %q", s)
+			return core.Proxy{}, fmt.Errorf("invalid port in %q", s)
 		}
-		return Proxy{Host: parts[0], Port: uint16(port), Username: parts[2], Password: parts[3]}, nil
+		return core.Proxy{Host: parts[0], Port: uint16(port), Username: parts[2], Password: parts[3]}, nil
 	default:
-		return Proxy{}, fmt.Errorf("expected host:port or host:port:user:pass, got %q", s)
+		return core.Proxy{}, fmt.Errorf("expected host:port or host:port:user:pass, got %q", s)
 	}
 }
 
-func parsePortAndOptionalCreds(host, rest string) (Proxy, error) {
+func parsePortAndOptionalCreds(host, rest string) (core.Proxy, error) {
 	parts := strings.SplitN(rest, ":", 3)
 	switch len(parts) {
 	case 1:
 		port, err := strconv.ParseUint(parts[0], 10, 16)
 		if err != nil {
-			return Proxy{}, fmt.Errorf("invalid port %q", parts[0])
+			return core.Proxy{}, fmt.Errorf("invalid port %q", parts[0])
 		}
-		return Proxy{Host: host, Port: uint16(port)}, nil
+		return core.Proxy{Host: host, Port: uint16(port)}, nil
 	case 3:
 		port, err := strconv.ParseUint(parts[0], 10, 16)
 		if err != nil {
-			return Proxy{}, fmt.Errorf("invalid port %q", parts[0])
+			return core.Proxy{}, fmt.Errorf("invalid port %q", parts[0])
 		}
-		return Proxy{Host: host, Port: uint16(port), Username: parts[1], Password: parts[2]}, nil
+		return core.Proxy{Host: host, Port: uint16(port), Username: parts[1], Password: parts[2]}, nil
 	default:
-		return Proxy{}, fmt.Errorf("expected port or port:user:pass after host, got %q", rest)
+		return core.Proxy{}, fmt.Errorf("expected port or port:user:pass after host, got %q", rest)
 	}
 }
 

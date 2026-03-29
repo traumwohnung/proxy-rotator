@@ -95,7 +95,7 @@ func buildSource(sourceType string, rawSource map[string]interface{}, configDir 
 	switch sourceType {
 	case "static_file":
 		var cfg utils.StaticFileConfig
-		cfg.Format = core.DefaultProxyFormat
+		cfg.Format = utils.DefaultProxyFormat
 		if err := json.Unmarshal(jsonBytes, &cfg); err != nil {
 			return nil, fmt.Errorf("invalid static_file config: %w", err)
 		}

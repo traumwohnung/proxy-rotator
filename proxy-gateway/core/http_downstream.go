@@ -1,6 +1,7 @@
 package core
 
 import (
+	"encoding/base64"
 	"fmt"
 	"log/slog"
 	"net"
@@ -16,6 +17,9 @@ import (
 type HTTPDownstream struct {
 	Upstream Upstream
 }
+
+// SetUpstream implements UpstreamAware.
+func (d *HTTPDownstream) SetUpstream(u Upstream) { d.Upstream = u }
 
 // Serve implements Downstream.
 func (d *HTTPDownstream) Serve(addr string, handler Handler) error {
@@ -137,38 +141,49 @@ func (d *HTTPDownstream) servePlainHTTP(w http.ResponseWriter, r *http.Request, 
 		"upstream", fmt.Sprintf("%s:%d", proxy.Host, proxy.Port),
 	)
 
-	var headers []string
-	for name, values := range r.Header {
-		if isHopByHop(name) {
-			continue
-		}
-		for _, v := range values {
-			headers = append(headers, name+": "+v)
-		}
-	}
-	uri := r.RequestURI
-	if !strings.HasPrefix(uri, "http://") && !strings.HasPrefix(uri, "https://") {
-		uri = "http://" + r.Host + uri
-	}
-
-	raw, err := ForwardPlainHTTP(r.Method, uri, headers, r.Body, proxy)
-
-	if result.ConnTracker != nil {
-		var reqBytes int64
-		if r.ContentLength > 0 {
-			reqBytes = r.ContentLength
-		}
-		respBytes := int64(len(raw))
-		result.ConnTracker.RecordTraffic(true, reqBytes, func() {})
-		result.ConnTracker.RecordTraffic(false, respBytes, func() {})
-		result.ConnTracker.Close(reqBytes, respBytes)
-	}
-
+	resp, err := ForwardPlainHTTP(r, proxy)
 	if err != nil {
 		http.Error(w, "upstream error: "+err.Error(), http.StatusBadGateway)
+		if result.ConnTracker != nil {
+			result.ConnTracker.Close(0, 0)
+		}
 		return
 	}
-	writeRawResponse(w, raw)
+	defer resp.Body.Close()
+
+	if result.ResponseHook != nil {
+		resp = result.ResponseHook(resp)
+	}
+
+	// Stream response to client.
+	for k, vs := range resp.Header {
+		for _, v := range vs {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+
+	var sent, received int64
+	if r.ContentLength > 0 {
+		sent = r.ContentLength
+	}
+	buf := make([]byte, 32*1024)
+	for {
+		n, rerr := resp.Body.Read(buf)
+		if n > 0 {
+			received += int64(n)
+			w.Write(buf[:n])
+		}
+		if rerr != nil {
+			break
+		}
+	}
+
+	if result.ConnTracker != nil {
+		result.ConnTracker.RecordTraffic(true, sent, func() {})
+		result.ConnTracker.RecordTraffic(false, received, func() {})
+		result.ConnTracker.Close(sent, received)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -186,4 +201,47 @@ func ListenHTTP(addr string, handler Handler) error {
 func HTTPProxyHandler(handler Handler) http.Handler {
 	d := &HTTPDownstream{Upstream: AutoUpstream()}
 	return d.httpHandler(handler)
+}
+
+// ---------------------------------------------------------------------------
+// HTTP helpers
+// ---------------------------------------------------------------------------
+
+func extractBasicAuth(headerVal string) (username, password string, err error) {
+	b64, ok := strings.CutPrefix(headerVal, "Basic ")
+	if !ok {
+		return "", "", fmt.Errorf("Proxy-Authorization must use Basic scheme")
+	}
+	decoded, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil {
+		return "", "", fmt.Errorf("invalid base64 in Proxy-Authorization")
+	}
+	raw := string(decoded)
+	colonIdx := strings.LastIndex(raw, ":")
+	if colonIdx < 0 {
+		return raw, "", nil
+	}
+	return raw[:colonIdx], raw[colonIdx+1:], nil
+}
+
+func writeHTTPResponse(w http.ResponseWriter, resp *http.Response) {
+	for k, vs := range resp.Header {
+		for _, v := range vs {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	if resp.Body != nil {
+		defer resp.Body.Close()
+		buf := make([]byte, 32*1024)
+		for {
+			n, err := resp.Body.Read(buf)
+			if n > 0 {
+				w.Write(buf[:n])
+			}
+			if err != nil {
+				break
+			}
+		}
+	}
 }

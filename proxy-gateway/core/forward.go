@@ -1,37 +1,60 @@
 package core
 
 import (
-	"encoding/base64"
 	"fmt"
-	"io"
-	"net"
+	"net/http"
+	"net/url"
 )
 
-// ForwardPlainHTTP sends a plain HTTP request through an upstream proxy.
-func ForwardPlainHTTP(method, uri string, headers []string, body io.Reader, proxy *Proxy) ([]byte, error) {
-	conn, err := net.Dial("tcp", hostPort(proxy.Host, proxy.Port))
-	if err != nil {
-		return nil, fmt.Errorf("connecting to upstream %s: %w", hostPort(proxy.Host, proxy.Port), err)
-	}
-	defer conn.Close()
-
-	req := fmt.Sprintf("%s %s HTTP/1.1\r\n", method, uri)
-	for _, h := range headers {
-		req += h + "\r\n"
+// ForwardPlainHTTP forwards a plain (non-CONNECT) HTTP request through an
+// upstream proxy and streams the response back to the caller.
+//
+// Uses net/http.Transport for proper streaming — the response body is NOT
+// buffered in memory. The caller is responsible for closing resp.Body.
+func ForwardPlainHTTP(r *http.Request, proxy *Proxy) (*http.Response, error) {
+	proxyURL := &url.URL{
+		Scheme: "http",
+		Host:   hostPort(proxy.Host, proxy.Port),
 	}
 	if proxy.Username != "" {
-		creds := base64.StdEncoding.EncodeToString([]byte(proxy.Username + ":" + proxy.Password))
-		req += "Proxy-Authorization: Basic " + creds + "\r\n"
+		proxyURL.User = url.UserPassword(proxy.Username, proxy.Password)
 	}
-	req += "\r\n"
+	if proxy.Proto() == ProtocolSOCKS5 {
+		proxyURL.Scheme = "socks5"
+	}
 
-	if _, err := fmt.Fprint(conn, req); err != nil {
-		return nil, err
+	transport := &http.Transport{
+		Proxy: http.ProxyURL(proxyURL),
 	}
-	if body != nil {
-		if _, err := io.Copy(conn, body); err != nil {
-			return nil, err
-		}
+
+	// Strip hop-by-hop headers and ensure absolute URI.
+	out := r.Clone(r.Context())
+	out.RequestURI = ""
+	if out.URL.Host == "" {
+		out.URL.Host = r.Host
 	}
-	return io.ReadAll(conn)
+	if out.URL.Scheme == "" {
+		out.URL.Scheme = "http"
+	}
+	for h := range hopByHopHeaders {
+		out.Header.Del(h)
+	}
+
+	resp, err := transport.RoundTrip(out)
+	if err != nil {
+		return nil, fmt.Errorf("forwarding to %s via %s: %w", r.Host, proxy.Host, err)
+	}
+	return resp, nil
+}
+
+// hopByHopHeaders lists headers that must not be forwarded.
+var hopByHopHeaders = map[string]struct{}{
+	"Connection":          {},
+	"Keep-Alive":          {},
+	"Proxy-Authenticate":  {},
+	"Proxy-Authorization": {},
+	"Te":                  {},
+	"Trailers":            {},
+	"Transfer-Encoding":   {},
+	"Upgrade":             {},
 }

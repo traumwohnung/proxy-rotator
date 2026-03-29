@@ -9,7 +9,7 @@ import (
 // countingReader wraps an io.Reader and calls RecordTraffic on every Read.
 type countingReader struct {
 	r        io.Reader
-	upstream bool // true = client→upstream, false = upstream→client
+	outbound bool // true = client→upstream (upload), false = upstream→client (download)
 	handle   ConnTracker
 	cancel   func()
 }
@@ -17,7 +17,7 @@ type countingReader struct {
 func (cr *countingReader) Read(p []byte) (int, error) {
 	n, err := cr.r.Read(p)
 	if n > 0 {
-		cr.handle.RecordTraffic(cr.upstream, int64(n), cr.cancel)
+		cr.handle.RecordTraffic(cr.outbound, int64(n), cr.cancel)
 	}
 	return n, err
 }
@@ -32,8 +32,8 @@ func relay(client, upstream net.Conn, handle ConnTracker) (sent, received int64)
 	var clientReader io.Reader = client
 	var upstreamReader io.Reader = upstream
 	if handle != nil {
-		clientReader = &countingReader{r: client, upstream: true, handle: handle, cancel: cancelConn}
-		upstreamReader = &countingReader{r: upstream, upstream: false, handle: handle, cancel: cancelConn}
+		clientReader = &countingReader{r: client, outbound: true, handle: handle, cancel: cancelConn}
+		upstreamReader = &countingReader{r: upstream, outbound: false, handle: handle, cancel: cancelConn}
 	}
 
 	type result struct {

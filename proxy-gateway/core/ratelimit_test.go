@@ -5,9 +5,15 @@ import (
 	"testing"
 )
 
-// ---------------------------------------------------------------------------
-// RateLimiting
-// ---------------------------------------------------------------------------
+func resolveWithSub(t *testing.T, h Handler, sub string) *Result {
+	t.Helper()
+	ctx := WithSub(context.Background(), sub)
+	result, err := h.Resolve(ctx, &Request{})
+	if err != nil {
+		t.Fatalf("unexpected resolve error: %v", err)
+	}
+	return result
+}
 
 func TestRateLimitConcurrentConnections(t *testing.T) {
 	source := HandlerFunc(func(_ context.Context, _ *Request) (*Result, error) {
@@ -16,22 +22,21 @@ func TestRateLimitConcurrentConnections(t *testing.T) {
 	rl := RateLimit(source, StaticLimits([]RateLimitRule{
 		{Type: LimitConcurrentConnections, Timeframe: Realtime, Max: 2},
 	}))
-	h1, err := rl.OpenConnection("alice")
-	if err != nil {
-		t.Fatal(err)
+
+	r1 := resolveWithSub(t, rl, "alice")
+	r2 := resolveWithSub(t, rl, "alice")
+
+	// Third should be rejected.
+	ctx := WithSub(context.Background(), "alice")
+	if _, err := rl.Resolve(ctx, &Request{}); err == nil {
+		t.Fatal("expected connection limit error on third resolve")
 	}
-	h2, err := rl.OpenConnection("alice")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := rl.OpenConnection("alice"); err == nil {
-		t.Fatal("expected connection limit error")
-	}
-	h1.Close(0, 0)
-	if _, err := rl.OpenConnection("alice"); err != nil {
-		t.Fatalf("should succeed after close: %v", err)
-	}
-	h2.Close(0, 0)
+
+	// After closing one, fourth should succeed.
+	r1.ConnTracker.Close(0, 0)
+	resolveWithSub(t, rl, "alice").ConnTracker.Close(0, 0)
+
+	r2.ConnTracker.Close(0, 0)
 }
 
 func TestRateLimitBandwidthMidConnection(t *testing.T) {
@@ -41,20 +46,18 @@ func TestRateLimitBandwidthMidConnection(t *testing.T) {
 	rl := RateLimit(source, StaticLimits([]RateLimitRule{
 		{Type: LimitUploadBytes, Timeframe: Hourly, Window: 1, Max: 100},
 	}))
-	h, err := rl.OpenConnection("alice")
-	if err != nil {
-		t.Fatal(err)
-	}
+
+	r := resolveWithSub(t, rl, "alice")
 	cancelled := false
-	h.RecordTraffic(true, 80, func() { cancelled = true })
+	r.ConnTracker.RecordTraffic(true, 80, func() { cancelled = true })
 	if cancelled {
-		t.Fatal("should not cancel yet")
+		t.Fatal("should not cancel yet at 80 bytes")
 	}
-	h.RecordTraffic(true, 30, func() { cancelled = true })
+	r.ConnTracker.RecordTraffic(true, 30, func() { cancelled = true })
 	if !cancelled {
-		t.Fatal("expected cancel when upload limit exceeded")
+		t.Fatal("expected cancel when upload limit exceeded (80+30 > 100)")
 	}
-	h.Close(110, 0)
+	r.ConnTracker.Close(110, 0)
 }
 
 func TestRateLimitWrapsResultConnTracker(t *testing.T) {
@@ -65,14 +68,31 @@ func TestRateLimitWrapsResultConnTracker(t *testing.T) {
 		{Type: LimitConcurrentConnections, Timeframe: Realtime, Max: 10},
 	}))
 
-	ctx := WithSub(context.Background(), "alice")
-	result, err := rl.Resolve(ctx, &Request{})
-	if err != nil {
-		t.Fatal(err)
-	}
+	result := resolveWithSub(t, rl, "alice")
 	if result.ConnTracker == nil {
 		t.Fatal("expected ConnTracker in result")
 	}
-	// Close it to decrement concurrent counter.
 	result.ConnTracker.Close(0, 0)
+}
+
+func TestRateLimitEmptySubFallback(t *testing.T) {
+	// When no sub is in context, rate limiting still works — all
+	// anonymous traffic shares the "" bucket.
+	source := HandlerFunc(func(_ context.Context, _ *Request) (*Result, error) {
+		return Resolved(&Proxy{Host: "upstream", Port: 8080}), nil
+	})
+	rl := RateLimit(source, StaticLimits([]RateLimitRule{
+		{Type: LimitConcurrentConnections, Timeframe: Realtime, Max: 1},
+	}))
+
+	// First resolves fine.
+	r, err := rl.Resolve(context.Background(), &Request{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Second (same empty sub bucket) should be rejected.
+	if _, err := rl.Resolve(context.Background(), &Request{}); err == nil {
+		t.Fatal("expected limit exceeded for shared anonymous bucket")
+	}
+	r.ConnTracker.Close(0, 0)
 }

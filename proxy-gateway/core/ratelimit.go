@@ -108,6 +108,10 @@ func RateLimit(next Handler, opts ...RateLimitOption) *RateLimiter {
 
 // Resolve implements Handler. It checks pre-connection limits,
 // delegates to the inner handler, then wraps the Result.ConnTracker.
+//
+// Rate limits are keyed by Sub(ctx). If no sub is set (empty string),
+// all traffic shares a single anonymous bucket — limits apply globally
+// across all unauthenticated connections.
 func (h *RateLimiter) Resolve(ctx context.Context, req *Request) (*Result, error) {
 	sub := Sub(ctx)
 	limits := h.limits(sub)
@@ -161,27 +165,6 @@ func (h *RateLimiter) openConnection(sub string, limits []RateLimitRule, st *use
 	}
 
 	return &rlConnTracker{limits: limits, state: st}, nil
-}
-
-// OpenConnection is a standalone method for creating tracked handles
-// (used by tests and direct callers).
-func (h *RateLimiter) OpenConnection(sub string) (ConnTracker, error) {
-	limits := h.limits(sub)
-	if len(limits) == 0 {
-		return &noopHandle{}, nil
-	}
-	st := h.getState(sub, limits)
-	if err := checkWindowedLimits(limits, st); err != nil {
-		return nil, err
-	}
-	return h.openConnection(sub, limits, st)
-}
-
-// ResetUser clears all tracked state for a user.
-func (h *RateLimiter) ResetUser(sub string) {
-	h.mu.Lock()
-	delete(h.state, sub)
-	h.mu.Unlock()
 }
 
 func (h *RateLimiter) getState(sub string, limits []RateLimitRule) *userState {

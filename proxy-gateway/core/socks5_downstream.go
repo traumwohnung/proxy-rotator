@@ -1,6 +1,7 @@
 package core
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log/slog"
@@ -15,6 +16,9 @@ import (
 type SOCKS5Downstream struct {
 	Upstream Upstream
 }
+
+// SetUpstream implements UpstreamAware.
+func (d *SOCKS5Downstream) SetUpstream(u Upstream) { d.Upstream = u }
 
 // Serve implements Downstream.
 func (d *SOCKS5Downstream) Serve(addr string, handler Handler) error {
@@ -98,7 +102,8 @@ func (d *SOCKS5Downstream) handleConn(conn net.Conn, handler Handler) {
 		Conn:        conn,
 	}
 
-	result, err := handler.Resolve(nil, req)
+	ctx := context.Background()
+	result, err := handler.Resolve(ctx, req)
 	if err != nil {
 		slog.Warn("resolve error", "err", err)
 		sendSOCKS5Reply(conn, 0x02)
@@ -111,7 +116,7 @@ func (d *SOCKS5Downstream) handleConn(conn net.Conn, handler Handler) {
 	}
 
 	proxy := result.Proxy
-	upstreamConn, err := d.Upstream.Dial(nil, proxy, target)
+	upstreamConn, err := d.Upstream.Dial(ctx, proxy, target)
 	if err != nil {
 		slog.Error("upstream dial failed", "err", err)
 		sendSOCKS5Reply(conn, 0x05)

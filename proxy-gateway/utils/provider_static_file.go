@@ -17,8 +17,8 @@ import (
 
 // StaticFileConfig is the configuration for a static proxy file source.
 type StaticFileConfig struct {
-	ProxiesFile string           `toml:"proxies_file" yaml:"proxies_file" json:"proxies_file"`
-	Format      core.ProxyFormat `toml:"format"       yaml:"format"       json:"format"`
+	ProxiesFile string      `toml:"proxies_file" yaml:"proxies_file" json:"proxies_file"`
+	Format      ProxyFormat `toml:"format"       yaml:"format"       json:"format"`
 }
 
 // ---------------------------------------------------------------------------
@@ -32,9 +32,9 @@ type StaticFileSource struct {
 }
 
 // LoadStaticFileSource loads proxies from a file.
-func LoadStaticFileSource(path string, format core.ProxyFormat) (*StaticFileSource, error) {
+func LoadStaticFileSource(path string, format ProxyFormat) (*StaticFileSource, error) {
 	if format == "" {
-		format = core.DefaultProxyFormat
+		format = DefaultProxyFormat
 	}
 	proxies, err := loadProxiesFromFile(path, format)
 	if err != nil {
@@ -77,7 +77,7 @@ func (s *StaticFileSource) Describe() string {
 // File parsing
 // ---------------------------------------------------------------------------
 
-func loadProxiesFromFile(path string, format core.ProxyFormat) ([]core.Proxy, error) {
+func loadProxiesFromFile(path string, format ProxyFormat) ([]core.Proxy, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("reading %s: %w", path, err)
@@ -93,7 +93,7 @@ func loadProxiesFromFile(path string, format core.ProxyFormat) ([]core.Proxy, er
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		p, err := core.ParseProxyLine(line, format)
+		p, err := ParseProxyLine(line, format)
 		if err != nil {
 			return nil, fmt.Errorf("%s:%d: invalid proxy entry %q: %w", path, lineNum, line, err)
 		}

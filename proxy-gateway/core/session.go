@@ -39,14 +39,21 @@ type SessionHandler struct {
 	nextID   atomic.Uint64
 }
 
-// Sticky creates a SessionHandler that pins sessions to the same upstream
+// Session creates a SessionHandler that pins sessions to the same upstream
 // for the TTL encoded in SessionTTL(ctx). If SessionTTL is 0 or SessionKey
 // is empty, the request passes straight through to next.
+// Session creates a SessionHandler that pins requests with the same SessionKey
+// to the same upstream proxy for the TTL encoded in SessionTTL(ctx).
+// If SessionTTL is 0 or SessionKey is empty, requests pass straight through.
+//
+// A cleanup goroutine is started automatically to prune expired sessions.
 func Session(next Handler) *SessionHandler {
-	return &SessionHandler{
+	s := &SessionHandler{
 		next:     next,
 		sessions: make(map[string]*stickyEntry),
 	}
+	go s.runCleanup()
+	return s
 }
 
 // Resolve implements Handler.
@@ -157,21 +164,18 @@ func (s *SessionHandler) ForceRotate(ctx context.Context, key string) (*SessionI
 	return info, nil
 }
 
-// SpawnCleanup starts a background goroutine that prunes expired sessions.
-func (s *SessionHandler) SpawnCleanup() {
-	go func() {
-		ticker := time.NewTicker(60 * time.Second)
-		defer ticker.Stop()
-		for range ticker.C {
-			s.mu.Lock()
-			for key, e := range s.sessions {
-				if time.Since(e.startedAt) >= e.duration {
-					delete(s.sessions, key)
-				}
+func (s *SessionHandler) runCleanup() {
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		s.mu.Lock()
+		for key, e := range s.sessions {
+			if time.Since(e.startedAt) >= e.duration {
+				delete(s.sessions, key)
 			}
-			s.mu.Unlock()
 		}
-	}()
+		s.mu.Unlock()
+	}
 }
 
 func infoFrom(key string, e *stickyEntry) *SessionInfo {

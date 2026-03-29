@@ -63,15 +63,17 @@ func (s *StandardInterceptor) RoundTrip(ctx context.Context, httpReq *http.Reque
 	}
 	defer tlsUp.Close()
 
-	httpReq.URL.Scheme = ""
-	httpReq.URL.Host = ""
-	httpReq.RequestURI = ""
+	// Clone to avoid mutating the caller's request.
+	out := httpReq.Clone(ctx)
+	out.URL.Scheme = ""
+	out.URL.Host = ""
+	out.RequestURI = ""
 
-	if err := httpReq.Write(tlsUp); err != nil {
+	if err := out.Write(tlsUp); err != nil {
 		return nil, fmt.Errorf("writing request to target: %w", err)
 	}
 
-	resp, err := http.ReadResponse(bufio.NewReader(tlsUp), httpReq)
+	resp, err := http.ReadResponse(bufio.NewReader(tlsUp), out)
 	if err != nil {
 		return nil, fmt.Errorf("reading response from target: %w", err)
 	}
