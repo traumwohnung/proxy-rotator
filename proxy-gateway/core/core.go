@@ -1,19 +1,20 @@
 // Package core defines the fundamental types for the proxy gateway pipeline.
 //
 // The entire system is built around one interface: Handler. Everything —
-// credential parsing, authentication, rate limiting, session affinity, proxy
-// source selection — is a Handler that either enriches the Request context
-// and delegates to the next handler, or terminates the chain by returning
-// a Proxy.
+// credential parsing, authentication, rate limiting, session affinity,
+// TLS interception, request blocking/modification, proxy source selection —
+// is a Handler that either enriches the Request and delegates to the next
+// handler, or terminates by returning a Proxy (or nil to signal "I handled it").
 //
-// The gateway transport layer (HTTP, SOCKS5) only populates RawUsername and
-// RawPassword from the protocol. All semantic parsing (extracting sub, set,
-// meta, session TTL) is done by middleware — there is no hardcoded username
-// format in core or gateway.
+// The gateway transport layer populates only the raw fields (RawUsername,
+// RawPassword, Target, Conn). All semantic parsing and interception is
+// performed by middleware.
 package core
 
 import (
 	"context"
+	"net"
+	"net/http"
 )
 
 // Handler resolves an inbound proxy request to an upstream Proxy.
@@ -29,29 +30,63 @@ func (f HandlerFunc) Resolve(ctx context.Context, req *Request) (*Proxy, error) 
 }
 
 // Request carries all information about an inbound proxy request.
-// The gateway populates only the Raw* fields from the transport protocol.
-// Middleware enriches the structured fields as the request flows through
-// the pipeline.
+// The gateway populates only the raw/transport fields. Middleware enriches
+// the rest progressively as the request flows through the pipeline.
 type Request struct {
-	// --- Raw fields, set by the transport (gateway) ---
+	// ---- Raw transport fields (set by gateway) ----
 
-	// RawUsername is the raw username from the transport protocol
-	// (e.g. Basic auth username, SOCKS5 username). Not interpreted by gateway.
+	// RawUsername is the raw username from the transport (Basic auth / SOCKS5).
 	RawUsername string
 
-	// RawPassword is the raw password from the transport protocol.
+	// RawPassword is the raw password from the transport.
 	RawPassword string
 
-	// Target is the destination the client wants to reach (e.g. "example.com:443").
-	// Set by the gateway from the CONNECT target or request URI.
+	// Target is the destination host:port (from CONNECT or request URI).
 	Target string
 
-	// --- Structured fields, set by middleware ---
+	// Conn is the raw client connection. Set by the gateway for CONNECT
+	// requests (after hijack) and for SOCKS5 connections. Nil for plain HTTP.
+	//
+	// Middleware that wants to take over the connection (e.g. MITM TLS
+	// interception) reads/writes this directly and returns nil Proxy to
+	// signal "I handled it — don't tunnel."
+	Conn net.Conn
+
+	// ---- TLS state ----
+
+	// TLSBroken is true if a middleware has terminated the client's TLS
+	// (MITM interception). Downstream middleware can check this to avoid
+	// double-breaking and to know they're seeing plaintext.
+	TLSBroken bool
+
+	// TLSServerName is the SNI hostname from the client's TLS ClientHello.
+	// Set by MITM middleware when TLSBroken is true.
+	TLSServerName string
+
+	// ---- HTTP layer (set by MITM middleware for intercepted requests) ----
+
+	// HTTPRequest is the decoded HTTP request inside a broken TLS tunnel.
+	// Set by MITM middleware for each request in the decrypted stream.
+	// Also set by the gateway for plain (non-CONNECT) HTTP requests.
+	// Nil when the connection is an opaque tunnel.
+	HTTPRequest *http.Request
+
+	// HTTPResponse is set by middleware that wants to provide a synthetic
+	// response (e.g. blocking, caching). When non-nil the MITM layer
+	// sends this to the client instead of forwarding to upstream.
+	HTTPResponse *http.Response
+
+	// ResponseHook is called after the upstream responds, before sending
+	// to the client. Middleware can inspect/modify/replace the response.
+	// Multiple middleware can chain hooks by wrapping the previous one.
+	ResponseHook func(resp *http.Response) *http.Response
+
+	// ---- Structured fields (set by middleware) ----
 
 	// Sub is the subscriber/user identity, parsed from RawUsername by middleware.
 	Sub string
 
-	// Password is the credential, may be copied from RawPassword or parsed.
+	// Password is the credential, typically copied from RawPassword.
 	Password string
 
 	// Set is the proxy set name to route through.
@@ -61,18 +96,16 @@ type Request struct {
 	Meta Meta
 
 	// SessionKey is the stable key for sticky-session affinity.
-	// If empty, no affinity is applied.
 	SessionKey string
 
-	// SessionTTL is how long a sticky session should last (minutes).
-	// Zero means no affinity (new proxy every request).
+	// SessionTTL is how long a sticky session lasts (minutes). 0 = no affinity.
 	SessionTTL int
 }
 
 // Meta is a flat map of string/number metadata values.
 type Meta map[string]interface{}
 
-// GetString returns the string value for key, or "" if absent/not-a-string.
+// GetString returns the string value for key, or "".
 func (m Meta) GetString(key string) string {
 	v, _ := m[key].(string)
 	return v

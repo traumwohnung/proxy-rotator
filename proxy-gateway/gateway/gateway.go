@@ -1,10 +1,12 @@
-// Package gateway provides HTTP and SOCKS5 proxy servers that delegate
-// proxy resolution to a core.Handler pipeline.
+// Package gateway provides HTTP and SOCKS5 proxy transports.
 //
-// The gateway only extracts raw credentials from the transport protocol
-// (Basic auth username+password, SOCKS5 username+password) and puts them
-// into Request.RawUsername and Request.RawPassword. It does NOT interpret
-// the username format — that's the responsibility of middleware.
+// The gateway extracts raw credentials from the transport protocol and puts
+// them into Request.RawUsername / RawPassword. For CONNECT requests it also
+// sets Request.Conn (the hijacked client connection). For plain HTTP it sets
+// Request.HTTPRequest.
+//
+// If a Handler returns nil Proxy and nil error, the gateway assumes the
+// middleware has handled the connection itself (e.g. MITM interception).
 package gateway
 
 import (
@@ -31,7 +33,6 @@ func HTTPHandler(handler core.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		clientIP, _, _ := net.SplitHostPort(r.RemoteAddr)
 
-		// Extract raw credentials from Basic auth — no parsing.
 		rawUsername, rawPassword, err := extractBasicAuth(r.Header.Get("Proxy-Authorization"))
 		if err != nil {
 			slog.Warn("auth error", "method", r.Method, "uri", r.RequestURI, "client", clientIP, "err", err)
@@ -40,91 +41,67 @@ func HTTPHandler(handler core.Handler) http.Handler {
 			return
 		}
 
-		req := &core.Request{
-			RawUsername: rawUsername,
-			RawPassword: rawPassword,
-			Target:      r.Host,
-		}
-
-		proxy, err := handler.Resolve(r.Context(), req)
-		if err != nil {
-			slog.Warn("resolve error", "client", clientIP, "err", err)
-			http.Error(w, err.Error(), http.StatusForbidden)
-			return
-		}
-		if proxy == nil {
-			http.Error(w, "no proxy available", http.StatusServiceUnavailable)
-			return
-		}
-
-		slog.Info("routing",
-			"method", r.Method,
-			"uri", r.RequestURI,
-			"upstream", fmt.Sprintf("%s:%d", proxy.Host, proxy.Port),
-			"upstream_proto", proxy.GetProtocol(),
-			"client", clientIP,
-		)
-
-		var handle core.ConnHandle
-		if tracker, ok := handler.(core.ConnectionTracker); ok {
-			handle, err = tracker.OpenConnection(req.Sub)
-			if err != nil {
-				slog.Warn("connection rejected", "sub", req.Sub, "err", err)
-				http.Error(w, err.Error(), http.StatusTooManyRequests)
-				return
-			}
-		}
-
 		if r.Method == http.MethodConnect {
-			serveConnect(w, r, proxy, handle)
+			serveConnect(w, r, rawUsername, rawPassword, handler)
 		} else {
-			serveHTTP(w, r, proxy, handle)
+			servePlainHTTP(w, r, rawUsername, rawPassword, handler)
 		}
 	})
 }
 
-// extractBasicAuth decodes "Basic <b64>" into raw username and password
-// without interpreting the username content at all.
-func extractBasicAuth(headerVal string) (username, password string, err error) {
-	b64, ok := strings.CutPrefix(headerVal, "Basic ")
-	if !ok {
-		return "", "", fmt.Errorf("Proxy-Authorization must use Basic scheme")
-	}
-	decoded, err := base64.StdEncoding.DecodeString(b64)
-	if err != nil {
-		return "", "", fmt.Errorf("invalid base64 in Proxy-Authorization")
-	}
-	raw := string(decoded)
-	colonIdx := strings.LastIndex(raw, ":")
-	if colonIdx < 0 {
-		return raw, "", nil
-	}
-	return raw[:colonIdx], raw[colonIdx+1:], nil
-}
-
 // ---------------------------------------------------------------------------
-// HTTP CONNECT
+// CONNECT — hijack, set Conn, let pipeline handle it
 // ---------------------------------------------------------------------------
 
-func serveConnect(w http.ResponseWriter, r *http.Request, proxy *core.Proxy, handle core.ConnHandle) {
+func serveConnect(w http.ResponseWriter, r *http.Request, rawUser, rawPass string, handler core.Handler) {
 	hj, ok := w.(http.Hijacker)
 	if !ok {
 		http.Error(w, "hijacking not supported", http.StatusInternalServerError)
-		if handle != nil {
-			handle.Close(0, 0)
-		}
 		return
 	}
 	w.WriteHeader(http.StatusOK)
 	clientConn, _, err := hj.Hijack()
 	if err != nil {
 		slog.Error("hijack failed", "err", err)
-		if handle != nil {
-			handle.Close(0, 0)
-		}
 		return
 	}
+
+	req := &core.Request{
+		RawUsername: rawUser,
+		RawPassword: rawPass,
+		Target:      r.Host,
+		Conn:        clientConn, // middleware can take over
+	}
+
+	proxy, err := handler.Resolve(r.Context(), req)
+	if err != nil {
+		slog.Warn("resolve error", "target", r.Host, "err", err)
+		clientConn.Close()
+		return
+	}
+
+	// nil proxy + nil error = middleware handled the connection itself (e.g. MITM).
+	if proxy == nil {
+		return
+	}
+
+	// Normal tunnel: dial upstream and relay.
 	defer clientConn.Close()
+
+	slog.Info("tunneling",
+		"target", r.Host,
+		"upstream", fmt.Sprintf("%s:%d", proxy.Host, proxy.Port),
+		"upstream_proto", proxy.GetProtocol(),
+	)
+
+	var handle core.ConnHandle
+	if tracker, ok := handler.(core.ConnectionTracker); ok {
+		handle, err = tracker.OpenConnection(req.Sub)
+		if err != nil {
+			slog.Warn("connection rejected", "sub", req.Sub, "err", err)
+			return
+		}
+	}
 
 	upstreamConn, err := dialUpstream(proxy, r.Host)
 	if err != nil {
@@ -143,10 +120,50 @@ func serveConnect(w http.ResponseWriter, r *http.Request, proxy *core.Proxy, han
 }
 
 // ---------------------------------------------------------------------------
-// Plain HTTP forwarding
+// Plain HTTP — set HTTPRequest, let pipeline handle it
 // ---------------------------------------------------------------------------
 
-func serveHTTP(w http.ResponseWriter, r *http.Request, proxy *core.Proxy, handle core.ConnHandle) {
+func servePlainHTTP(w http.ResponseWriter, r *http.Request, rawUser, rawPass string, handler core.Handler) {
+	req := &core.Request{
+		RawUsername: rawUser,
+		RawPassword: rawPass,
+		Target:      r.Host,
+		HTTPRequest: r,
+	}
+
+	proxy, err := handler.Resolve(r.Context(), req)
+	if err != nil {
+		slog.Warn("resolve error", "target", r.Host, "err", err)
+		http.Error(w, err.Error(), http.StatusForbidden)
+		return
+	}
+
+	// If middleware provided a synthetic response, send it.
+	if req.HTTPResponse != nil {
+		writeHTTPResponse(w, req.HTTPResponse)
+		return
+	}
+
+	if proxy == nil {
+		http.Error(w, "no proxy available", http.StatusServiceUnavailable)
+		return
+	}
+
+	slog.Info("forwarding",
+		"method", r.Method,
+		"uri", r.RequestURI,
+		"upstream", fmt.Sprintf("%s:%d", proxy.Host, proxy.Port),
+	)
+
+	var handle core.ConnHandle
+	if tracker, ok := handler.(core.ConnectionTracker); ok {
+		handle, err = tracker.OpenConnection(req.Sub)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusTooManyRequests)
+			return
+		}
+	}
+
 	var headers []string
 	for name, values := range r.Header {
 		if isHopByHop(name) {
@@ -184,6 +201,45 @@ func serveHTTP(w http.ResponseWriter, r *http.Request, proxy *core.Proxy, handle
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+func extractBasicAuth(headerVal string) (username, password string, err error) {
+	b64, ok := strings.CutPrefix(headerVal, "Basic ")
+	if !ok {
+		return "", "", fmt.Errorf("Proxy-Authorization must use Basic scheme")
+	}
+	decoded, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil {
+		return "", "", fmt.Errorf("invalid base64 in Proxy-Authorization")
+	}
+	raw := string(decoded)
+	colonIdx := strings.LastIndex(raw, ":")
+	if colonIdx < 0 {
+		return raw, "", nil
+	}
+	return raw[:colonIdx], raw[colonIdx+1:], nil
+}
+
+func writeHTTPResponse(w http.ResponseWriter, resp *http.Response) {
+	for k, vs := range resp.Header {
+		for _, v := range vs {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	if resp.Body != nil {
+		defer resp.Body.Close()
+		buf := make([]byte, 32*1024)
+		for {
+			n, err := resp.Body.Read(buf)
+			if n > 0 {
+				w.Write(buf[:n])
+			}
+			if err != nil {
+				break
+			}
+		}
+	}
+}
 
 func writeRawResponse(w http.ResponseWriter, raw []byte) {
 	headerEnd := len(raw)

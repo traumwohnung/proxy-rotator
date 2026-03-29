@@ -9,9 +9,9 @@ import (
 	"proxy-gateway/core"
 )
 
-// RunSOCKS5 starts a SOCKS5 proxy server that delegates resolution to the pipeline.
-// The raw SOCKS5 username and password are placed into Request.RawUsername and
-// Request.RawPassword — the gateway does not interpret them.
+// RunSOCKS5 starts a SOCKS5 proxy server.
+// Raw credentials go into Request.RawUsername / RawPassword.
+// Request.Conn is set to the client connection.
 func RunSOCKS5(addr string, handler core.Handler) error {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -32,7 +32,7 @@ func RunSOCKS5(addr string, handler core.Handler) error {
 func handleSOCKS5Conn(conn net.Conn, handler core.Handler) {
 	defer conn.Close()
 
-	// --- SOCKS5 greeting ---
+	// Greeting.
 	var version [1]byte
 	if _, err := io.ReadFull(conn, version[:]); err != nil {
 		return
@@ -40,7 +40,6 @@ func handleSOCKS5Conn(conn net.Conn, handler core.Handler) {
 	if version[0] != 0x05 {
 		return
 	}
-
 	var nMethods [1]byte
 	io.ReadFull(conn, nMethods[:])
 	methods := make([]byte, nMethods[0])
@@ -56,7 +55,6 @@ func handleSOCKS5Conn(conn net.Conn, handler core.Handler) {
 	var rawUsername, rawPassword string
 	if hasUserPass {
 		conn.Write([]byte{0x05, 0x02})
-
 		var authVer [1]byte
 		io.ReadFull(conn, authVer[:])
 		var uLen [1]byte
@@ -67,22 +65,19 @@ func handleSOCKS5Conn(conn net.Conn, handler core.Handler) {
 		io.ReadFull(conn, pLen[:])
 		pBytes := make([]byte, pLen[0])
 		io.ReadFull(conn, pBytes)
-
 		rawUsername = string(uBytes)
 		rawPassword = string(pBytes)
-
-		// Accept — actual auth validation happens in the pipeline.
 		conn.Write([]byte{0x01, 0x00})
 	} else {
 		conn.Write([]byte{0x05, 0x00})
 	}
 
-	// --- CONNECT request ---
+	// CONNECT request.
 	var reqHeader [4]byte
 	if _, err := io.ReadFull(conn, reqHeader[:]); err != nil {
 		return
 	}
-	if reqHeader[1] != 0x01 { // only CONNECT
+	if reqHeader[1] != 0x01 {
 		sendSOCKS5Reply(conn, 0x07)
 		return
 	}
@@ -93,11 +88,11 @@ func handleSOCKS5Conn(conn net.Conn, handler core.Handler) {
 		return
 	}
 
-	// Build request with raw credentials only — no parsing.
 	req := &core.Request{
 		RawUsername: rawUsername,
 		RawPassword: rawPassword,
 		Target:      target,
+		Conn:        conn, // middleware can take over
 	}
 
 	proxy, err := handler.Resolve(nil, req)
@@ -106,11 +101,13 @@ func handleSOCKS5Conn(conn net.Conn, handler core.Handler) {
 		sendSOCKS5Reply(conn, 0x02)
 		return
 	}
+
+	// nil proxy = middleware handled it (e.g. MITM).
 	if proxy == nil {
-		sendSOCKS5Reply(conn, 0x01)
 		return
 	}
 
+	// Normal tunnel.
 	var handle core.ConnHandle
 	if tracker, ok := handler.(core.ConnectionTracker); ok {
 		handle, err = tracker.OpenConnection(req.Sub)
