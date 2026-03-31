@@ -504,10 +504,8 @@ func TestE2E_HTTPConnect_RejectsWrongPassword(t *testing.T) {
 	proxyAddr, closeProxy := startHTTPProxy(t, handler, directUpstream)
 	defer closeProxy()
 
-	// HTTPDownstream writes 200 before calling Resolve (after hijacking the
-	// connection). When auth fails, the tunnel is closed immediately without
-	// relaying any data. A wrong-password attempt therefore gets 200 but then
-	// EOF when it tries to send data through the tunnel.
+	// Resolve now happens before hijack, so a wrong password returns a proper
+	// HTTP error response (403) instead of 200+EOF.
 	conn, err := net.DialTimeout("tcp", proxyAddr, 3*time.Second)
 	if err != nil {
 		t.Fatal(err)
@@ -521,18 +519,11 @@ func TestE2E_HTTPConnect_RejectsWrongPassword(t *testing.T) {
 
 	statusLine, _ := readHTTPStatusLine(conn)
 	drainHTTPHeaders(conn) //nolint:errcheck
-	var httpVer2 string
+	var httpVer string
 	var statusCode int
-	fmt.Sscanf(statusLine, "HTTP/%s %d", &httpVer2, &statusCode)
-	// 200 is returned (hijack happens first), then the connection is closed.
-	if statusCode != http.StatusOK {
-		t.Fatalf("expected 200 (pre-auth hijack), got %d", statusCode)
-	}
-	// Sending data through the tunnel should get EOF because auth failed.
-	io.WriteString(conn, "hello\n")
-	_, readErr := readLine(conn)
-	if readErr == nil {
-		t.Fatal("expected EOF/error after wrong-password: connection should be closed by server")
+	fmt.Sscanf(statusLine, "HTTP/%s %d", &httpVer, &statusCode)
+	if statusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 for wrong password, got %d", statusCode)
 	}
 }
 
@@ -792,9 +783,8 @@ func TestE2E_RateLimit_BlocksExceedingConcurrentConnections(t *testing.T) {
 	}
 
 	// Second connection while first is still open.
-	// HTTPDownstream writes 200 before Resolve, then closes the connection
-	// when the rate-limit error is returned. We detect this as an EOF/error
-	// when trying to use the tunnel.
+	// Resolve now happens before hijack, so rate-limit rejection returns a
+	// proper HTTP error response (403) instead of 200+EOF.
 	time.Sleep(20 * time.Millisecond)
 	conn2, err := net.DialTimeout("tcp", proxyAddr, 3*time.Second)
 	if err != nil {
@@ -806,15 +796,10 @@ func TestE2E_RateLimit_BlocksExceedingConcurrentConnections(t *testing.T) {
 	sl2, _ := readHTTPStatusLine(conn2)
 	drainHTTPHeaders(conn2) //nolint:errcheck
 	var code2 int
-	var httpVerB string; fmt.Sscanf(sl2, "HTTP/%s %d", &httpVerB, &code2)
-	if code2 != 200 {
-		t.Fatalf("expected 200 (pre-resolve hijack), got %d", code2)
-	}
-	// The server closed the connection after rate-limiting. Any read should fail.
-	io.WriteString(conn2, "probe\n")
-	_, readErr := readLine(conn2)
-	if readErr == nil {
-		t.Fatal("expected rate-limit to close the connection, but got data")
+	var httpVerB string
+	fmt.Sscanf(sl2, "HTTP/%s %d", &httpVerB, &code2)
+	if code2 != http.StatusForbidden {
+		t.Fatalf("expected 403 for rate-limited connection, got %d", code2)
 	}
 }
 

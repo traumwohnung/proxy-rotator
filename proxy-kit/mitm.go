@@ -187,13 +187,22 @@ type mitmHandler struct {
 }
 
 func (m *mitmHandler) Resolve(ctx context.Context, req *Request) (*Result, error) {
-	// Only intercept tunnel connections (CONNECT / SOCKS5).
-	if req.Conn == nil {
+	// Don't intercept plain HTTP (HTTPRequest is set) or already-broken TLS.
+	if req.HTTPRequest != nil {
+		return m.inner.Resolve(ctx, req)
+	}
+	if ts := GetTLSState(ctx); ts.Broken {
 		return m.inner.Resolve(ctx, req)
 	}
 
-	// Don't double-intercept.
-	if ts := GetTLSState(ctx); ts.Broken {
+	// Only intercept CONNECT tunnels. If we don't have the client conn yet but
+	// we know we're in an HTTP CONNECT context, signal HTTPDownstream to hijack
+	// and call us again with req.Conn set. Otherwise (SOCKS5 or direct call)
+	// pass through to inner.
+	if req.Conn == nil {
+		if IsHTTPConnect(ctx) {
+			return WantsConn(), nil
+		}
 		return m.inner.Resolve(ctx, req)
 	}
 

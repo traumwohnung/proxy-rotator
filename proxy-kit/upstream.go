@@ -5,8 +5,8 @@ import (
 	"net"
 )
 
-// AutoUpstream returns an Upstream that dispatches to HTTPUpstream
-// or SOCKS5Upstream based on the proxy's Protocol field.
+// AutoUpstream returns an Upstream that dispatches to HTTPUpstream or
+// SOCKS5Upstream based on proxy.Protocol, using default dial timeouts.
 func AutoUpstream() Upstream {
 	h := HTTPUpstream{}
 	s := SOCKS5Upstream{}

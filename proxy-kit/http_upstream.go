@@ -5,14 +5,32 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net"
+	"time"
 )
 
-// HTTPUpstream implements Upstream using the HTTP CONNECT method.
-type HTTPUpstream struct{}
+// DefaultUpstreamDialTimeout is used by HTTPUpstream when no context deadline
+// is set and no explicit timeout is configured.
+const DefaultUpstreamDialTimeout = 15 * time.Second
 
-func (HTTPUpstream) Dial(_ context.Context, proxy *Proxy, target string) (net.Conn, error) {
+type HTTPUpstream struct {
+	// DialTimeout overrides DefaultUpstreamDialTimeout.
+	// Zero means use the default.
+	DialTimeout time.Duration
+}
+
+func (u HTTPUpstream) dialTimeout() time.Duration {
+	if u.DialTimeout != 0 {
+		return u.DialTimeout
+	}
+	return DefaultUpstreamDialTimeout
+}
+
+func (u HTTPUpstream) Dial(ctx context.Context, proxy *Proxy, target string) (net.Conn, error) {
 	addr := hostPort(proxy.Host, proxy.Port)
-	conn, err := net.Dial("tcp", addr)
+
+	// Use context deadline if set, otherwise fall back to the configured timeout.
+	dialer := &net.Dialer{Timeout: u.dialTimeout()}
+	conn, err := dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("connecting to upstream %s: %w", addr, err)
 	}
@@ -28,7 +46,8 @@ func (HTTPUpstream) Dial(_ context.Context, proxy *Proxy, target string) (net.Co
 		return nil, fmt.Errorf("sending CONNECT: %w", err)
 	}
 
-	// Read full response (loop until \r\n\r\n).
+	// Apply a read deadline while waiting for the CONNECT response.
+	conn.SetDeadline(time.Now().Add(u.dialTimeout()))
 	var respBuf []byte
 	tmp := make([]byte, 1024)
 	for {
@@ -44,6 +63,8 @@ func (HTTPUpstream) Dial(_ context.Context, proxy *Proxy, target string) (net.Co
 			break
 		}
 	}
+	conn.SetDeadline(time.Time{}) // clear deadline for tunnel use
+
 	resp := string(respBuf)
 	if len(resp) < 12 || (resp[:12] != "HTTP/1.1 200" && resp[:12] != "HTTP/1.0 200") {
 		conn.Close()

@@ -52,6 +52,20 @@ type Result struct {
 
 	// UpstreamConn is a pre-dialed upstream connection (used by MITM).
 	UpstreamConn net.Conn
+
+	// NeedsConn signals that this handler requires the raw client connection
+	// (req.Conn) to be set before it can fully resolve. HTTPDownstream will
+	// hijack the connection and call Resolve again with req.Conn populated.
+	// Used by middleware such as MITM that must perform a TLS handshake with
+	// the client before knowing which upstream to use.
+	NeedsConn bool
+}
+
+// WantsConn returns a Result that tells HTTPDownstream to re-resolve with the
+// hijacked client connection. Middleware should return this when req.Conn == nil
+// and they need it to proceed (e.g. MITM TLS interception).
+func WantsConn() *Result {
+	return &Result{NeedsConn: true}
 }
 
 // Resolved is a convenience for returning a Result with just a Proxy.

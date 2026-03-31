@@ -4,16 +4,25 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"time"
 
 	"golang.org/x/net/proxy"
 )
 
-// SOCKS5Upstream implements Upstream using the SOCKS5 protocol.
-// Uses golang.org/x/net/proxy which is the standard Go SOCKS5 client,
-// handling RFC 1928 + RFC 1929 auth correctly.
-type SOCKS5Upstream struct{}
+type SOCKS5Upstream struct {
+	// DialTimeout overrides DefaultUpstreamDialTimeout.
+	// Zero means use the default.
+	DialTimeout time.Duration
+}
 
-func (SOCKS5Upstream) Dial(ctx context.Context, p *Proxy, target string) (net.Conn, error) {
+func (u SOCKS5Upstream) dialTimeout() time.Duration {
+	if u.DialTimeout != 0 {
+		return u.DialTimeout
+	}
+	return DefaultUpstreamDialTimeout
+}
+
+func (u SOCKS5Upstream) Dial(ctx context.Context, p *Proxy, target string) (net.Conn, error) {
 	addr := hostPort(p.Host, p.Port)
 
 	var auth *proxy.Auth
@@ -21,12 +30,12 @@ func (SOCKS5Upstream) Dial(ctx context.Context, p *Proxy, target string) (net.Co
 		auth = &proxy.Auth{User: p.Username, Password: p.Password}
 	}
 
-	dialer, err := proxy.SOCKS5("tcp", addr, auth, proxy.Direct)
+	baseDialer := &net.Dialer{Timeout: u.dialTimeout()}
+	dialer, err := proxy.SOCKS5("tcp", addr, auth, baseDialer)
 	if err != nil {
 		return nil, fmt.Errorf("creating SOCKS5 dialer for %s: %w", addr, err)
 	}
 
-	// Use DialContext if available for proper cancellation support.
 	if cd, ok := dialer.(proxy.ContextDialer); ok {
 		return cd.DialContext(ctx, "tcp", target)
 	}
