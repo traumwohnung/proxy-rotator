@@ -17,9 +17,12 @@ import (
 	"github.com/sardanioss/httpcloak/fingerprint"
 	httpcloaktransport "github.com/sardanioss/httpcloak/transport"
 	utls "github.com/sardanioss/utls"
+	"github.com/ua-parser/uap-go/uaparser"
 
 	proxykit "proxy-kit"
 )
+
+var uaParser = uaparser.NewFromSaved()
 
 // ---------------------------------------------------------------------------
 // HTTPCloakSpec — the "httpcloak" field in the username JSON
@@ -67,6 +70,12 @@ type HTTPCloakSpec struct {
 
 	// PermuteExtensions randomises the TLS extension order.
 	PermuteExtensions bool `json:"permute_extensions"`
+
+	// UserAgent controls how the User-Agent header is handled:
+	//   "ignore"  — pass through the client's User-Agent unchanged (default)
+	//   "preset"  — replace with the preset's User-Agent
+	//   "check"   — reject if the client's User-Agent doesn't match the preset's browser family
+	UserAgent string `json:"user_agent"`
 }
 
 // ParseHTTPCloakSpec decodes a raw JSON value that is either:
@@ -97,6 +106,12 @@ func ParseHTTPCloakSpec(raw json.RawMessage) (*HTTPCloakSpec, error) {
 	}
 	if spec.Preset == "" {
 		spec.Preset = "chrome-latest"
+	}
+	switch spec.UserAgent {
+	case "", "ignore", "preset", "check":
+		// valid
+	default:
+		return nil, fmt.Errorf("httpcloak user_agent must be \"ignore\", \"preset\", or \"check\", got %q", spec.UserAgent)
 	}
 	return &spec, nil
 }
@@ -129,6 +144,54 @@ func (s *HTTPCloakSpec) sessionOptions(proxyURL string, insecure bool) []httpclo
 		}))
 	}
 	return opts
+}
+
+// applyUserAgentPolicy modifies or validates the User-Agent header based on
+// the spec's UserAgent mode.
+func (s *HTTPCloakSpec) applyUserAgentPolicy(headers map[string][]string) error {
+	switch s.UserAgent {
+	case "preset":
+		preset := fingerprint.Get(s.Preset)
+		if preset.UserAgent != "" {
+			headers["User-Agent"] = []string{preset.UserAgent}
+		}
+	case "check":
+		preset := fingerprint.Get(s.Preset)
+		ua := ""
+		for k, vs := range headers {
+			if strings.EqualFold(k, "user-agent") && len(vs) > 0 {
+				ua = vs[0]
+				break
+			}
+		}
+		if ua == "" {
+			return fmt.Errorf("user_agent=check: no User-Agent header provided")
+		}
+		if !userAgentMatchesPreset(ua, preset.UserAgent) {
+			return fmt.Errorf("user_agent=check: User-Agent %q is not consistent with preset %q", ua, s.Preset)
+		}
+	}
+	// "ignore" or "": pass through unchanged
+	return nil
+}
+
+// userAgentMatchesPreset checks if a User-Agent string is consistent with the
+// preset's browser family. It parses both the client UA and the preset's UA
+// using ua-parser and compares browser families.
+func userAgentMatchesPreset(clientUA, presetUA string) bool {
+	if presetUA == "" {
+		return true // no preset UA to compare against
+	}
+	clientParsed := uaParser.Parse(clientUA)
+	presetParsed := uaParser.Parse(presetUA)
+
+	clientFamily := strings.ToLower(clientParsed.UserAgent.Family)
+	presetFamily := strings.ToLower(presetParsed.UserAgent.Family)
+
+	if clientFamily == "" || presetFamily == "" {
+		return true // can't determine, allow
+	}
+	return clientFamily == presetFamily
 }
 
 // ---------------------------------------------------------------------------
@@ -185,6 +248,12 @@ func (f *tlsFingerprintInterceptor) RoundTrip(ctx context.Context, httpReq *http
 			continue
 		}
 		headers[k] = vs
+	}
+
+	// Apply user_agent policy.
+	if err := f.spec.applyUserAgentPolicy(headers); err != nil {
+		session.Close()
+		return nil, err
 	}
 
 	cloakReq := &httpcloak.Request{

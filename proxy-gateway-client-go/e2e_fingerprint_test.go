@@ -26,14 +26,7 @@ type fingerprintEchoResponse struct {
 		JA3Raw  string `json:"ja3_raw"`
 		JA4     string `json:"ja4"`
 	} `json:"fingerprint"`
-	Verdict struct {
-		Level string  `json:"level"`
-		Score float64 `json:"score"`
-	} `json:"verdict"`
-	HTTPCloakPresetMatches []struct {
-		Name      string `json:"name"`
-		UserAgent string `json:"user_agent"`
-	} `json:"httpcloak_preset_matches"`
+	UAConsistent bool `json:"ua_consistent"`
 }
 
 func directFingerprintRequest(t *testing.T, echoURL, preset string) fingerprintEchoResponse {
@@ -200,9 +193,9 @@ func TestE2E_HTTPCloak_TLSFingerprintEcho(t *testing.T) {
 			if result.Fingerprint.JA3Hash == "" {
 				t.Fatalf("expected non-empty ja3_hash (full response: %s)", body)
 			}
-			t.Logf("proxied: ja3_hash=%s  ja4=%s  verdict=%s (score=%.2f)",
+			t.Logf("proxied: ja3_hash=%s  ja4=%s  ua_consistent=%v",
 				result.Fingerprint.JA3Hash, result.Fingerprint.JA4,
-				result.Verdict.Level, result.Verdict.Score)
+				result.UAConsistent)
 
 			direct := directFingerprintRequest(t, echoURL, preset)
 			t.Logf("direct:  ja3_hash=%s  ja4=%s", direct.Fingerprint.JA3Hash, direct.Fingerprint.JA4)
