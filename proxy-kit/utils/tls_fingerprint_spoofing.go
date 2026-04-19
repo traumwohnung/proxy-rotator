@@ -3,17 +3,22 @@ package utils
 import (
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/sardanioss/httpcloak"
+	"github.com/sardanioss/httpcloak/fingerprint"
+	httpcloaktransport "github.com/sardanioss/httpcloak/transport"
+	utls "github.com/sardanioss/utls"
 
-	"proxy-kit"
+	proxykit "proxy-kit"
 )
 
 // ---------------------------------------------------------------------------
@@ -234,6 +239,96 @@ func (b *sessionClosingBody) Close() error {
 	err := b.ReadCloser.Close()
 	b.session.Close()
 	return err
+}
+
+// DialTLS implements proxykit.WebSocketDialer. It dials the target with a
+// browser-like TLS fingerprint using utls, optionally through an upstream proxy.
+// target is "host:port".
+func (f *tlsFingerprintInterceptor) DialTLS(ctx context.Context, target string, proxy *proxykit.Proxy) (net.Conn, error) {
+	preset := fingerprint.Get(f.spec.Preset)
+	host, _, _ := net.SplitHostPort(target)
+
+	dialer := &net.Dialer{Timeout: 30 * time.Second}
+	httpcloaktransport.SetDialerControl(dialer, &preset.TCPFingerprint)
+
+	var rawConn net.Conn
+	var err error
+	if proxy.Host == "" {
+		rawConn, err = dialer.DialContext(ctx, "tcp", target)
+	} else {
+		rawConn, err = dialThroughProxy(ctx, dialer, proxy, target)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("dial %s: %w", target, err)
+	}
+
+	tlsConfig := &utls.Config{
+		ServerName:         host,
+		InsecureSkipVerify: f.insecure,
+	}
+	tlsConn := utls.UClient(rawConn, tlsConfig, preset.ClientHelloID)
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		rawConn.Close()
+		return nil, fmt.Errorf("utls handshake %s: %w", host, err)
+	}
+	return tlsConn, nil
+}
+
+// dialThroughProxy establishes a CONNECT tunnel through an upstream HTTP proxy
+// and returns the raw tunnel connection.
+func dialThroughProxy(ctx context.Context, dialer *net.Dialer, proxy *proxykit.Proxy, target string) (net.Conn, error) {
+	addr := fmt.Sprintf("%s:%d", proxy.Host, proxy.Port)
+	conn, err := dialer.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("connecting to proxy %s: %w", addr, err)
+	}
+
+	req := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n", target, target)
+	if proxy.Username != "" {
+		creds := base64.StdEncoding.EncodeToString([]byte(proxy.Username + ":" + proxy.Password))
+		req += "Proxy-Authorization: Basic " + creds + "\r\n"
+	}
+	req += "\r\n"
+
+	if _, err := fmt.Fprint(conn, req); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("sending CONNECT: %w", err)
+	}
+
+	// Read response.
+	conn.SetDeadline(time.Now().Add(15 * time.Second))
+	var respBuf []byte
+	tmp := make([]byte, 1024)
+	for {
+		n, readErr := conn.Read(tmp)
+		if n > 0 {
+			respBuf = append(respBuf, tmp[:n]...)
+		}
+		if readErr != nil {
+			conn.Close()
+			return nil, fmt.Errorf("reading CONNECT response: %w", readErr)
+		}
+		if containsCRLFCRLF(respBuf) {
+			break
+		}
+	}
+	conn.SetDeadline(time.Time{})
+
+	resp := string(respBuf)
+	if len(resp) < 12 || (resp[:12] != "HTTP/1.1 200" && resp[:12] != "HTTP/1.0 200") {
+		conn.Close()
+		return nil, fmt.Errorf("proxy rejected CONNECT: %s", resp)
+	}
+	return conn, nil
+}
+
+func containsCRLFCRLF(b []byte) bool {
+	for i := 0; i+3 < len(b); i++ {
+		if b[i] == '\r' && b[i+1] == '\n' && b[i+2] == '\r' && b[i+3] == '\n' {
+			return true
+		}
+	}
+	return false
 }
 
 // ---------------------------------------------------------------------------

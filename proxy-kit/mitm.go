@@ -38,6 +38,16 @@ type Interceptor interface {
 	RoundTrip(ctx context.Context, req *http.Request, host string, proxy *Proxy) (*http.Response, error)
 }
 
+// WebSocketDialer is an optional interface that Interceptors can implement to
+// support WebSocket upgrades through MITM. DialTLS returns a TLS connection
+// to the target (optionally through an upstream proxy) with a browser-like
+// TLS fingerprint. The caller owns the returned connection.
+//
+// target is "host:port" (e.g. "example.com:443" or "127.0.0.1:8443").
+type WebSocketDialer interface {
+	DialTLS(ctx context.Context, target string, proxy *Proxy) (net.Conn, error)
+}
+
 // InterceptorFunc adapts a function to the Interceptor interface.
 type InterceptorFunc func(ctx context.Context, req *http.Request, host string, proxy *Proxy) (*http.Response, error)
 
@@ -80,6 +90,21 @@ func (s *StandardInterceptor) RoundTrip(ctx context.Context, httpReq *http.Reque
 		return nil, fmt.Errorf("reading response from target: %w", err)
 	}
 	return resp, nil
+}
+
+// DialTLS implements WebSocketDialer for StandardInterceptor.
+func (s *StandardInterceptor) DialTLS(ctx context.Context, target string, proxy *Proxy) (net.Conn, error) {
+	host := targetHost(target)
+	upstreamConn, err := s.Upstream.Dial(ctx, proxy, target)
+	if err != nil {
+		return nil, err
+	}
+	tlsUp := tls.Client(upstreamConn, &tls.Config{ServerName: host})
+	if err := tlsUp.Handshake(); err != nil {
+		upstreamConn.Close()
+		return nil, fmt.Errorf("TLS to target %s: %w", host, err)
+	}
+	return tlsUp, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -254,10 +279,92 @@ func (m *mitmHandler) serveH1(ctx context.Context, tlsConn *tls.Conn, outerReq *
 			break
 		}
 
+		if isWebSocketUpgrade(httpReq) {
+			m.handleWebSocketUpgrade(ctx, tlsConn, br, httpReq, outerReq, host)
+			return // WebSocket takes over the connection
+		}
+
 		resp := m.roundTripMITM(ctx, httpReq, outerReq, host)
 		resp.Write(tlsConn)
 		resp.Body.Close()
 	}
+}
+
+func isWebSocketUpgrade(r *http.Request) bool {
+	return strings.EqualFold(r.Header.Get("Upgrade"), "websocket")
+}
+
+// handleWebSocketUpgrade dials the upstream with a fingerprinted TLS
+// connection, forwards the upgrade request, relays the 101 response, then
+// enters bidirectional relay for WebSocket frames.
+func (m *mitmHandler) handleWebSocketUpgrade(ctx context.Context, clientConn net.Conn, clientBuf *bufio.Reader, httpReq *http.Request, outerReq *Request, host string) {
+	// Use the original CONNECT target (host:port) so non-443 ports work.
+	target := outerReq.Target
+	if _, _, err := net.SplitHostPort(target); err != nil {
+		target = host + ":443"
+	}
+
+	// Resolve upstream proxy.
+	childReq := &Request{
+		RawUsername:  outerReq.RawUsername,
+		RawPassword: outerReq.RawPassword,
+		Target:      target,
+		HTTPRequest: httpReq,
+	}
+	result, err := m.inner.Resolve(ctx, childReq)
+	if err != nil || result == nil || result.Proxy == nil {
+		msg := "websocket: no upstream"
+		if err != nil {
+			msg = "websocket: " + err.Error()
+		}
+		errorResponse(http.StatusBadGateway, msg).Write(clientConn)
+		return
+	}
+
+	// Dial upstream with fingerprinted TLS if the interceptor supports it.
+	wsDialer, ok := m.interceptor.(WebSocketDialer)
+	if !ok {
+		errorResponse(http.StatusBadGateway, "websocket: interceptor does not support upgrades").Write(clientConn)
+		return
+	}
+	upstreamConn, err := wsDialer.DialTLS(ctx, target, result.Proxy)
+	if err != nil {
+		errorResponse(http.StatusBadGateway, "websocket: "+err.Error()).Write(clientConn)
+		return
+	}
+	defer upstreamConn.Close()
+
+	// Forward the upgrade request to upstream.
+	if err := httpReq.Write(upstreamConn); err != nil {
+		errorResponse(http.StatusBadGateway, "websocket: "+err.Error()).Write(clientConn)
+		return
+	}
+
+	// Read the upgrade response from upstream.
+	upstreamBuf := bufio.NewReader(upstreamConn)
+	resp, err := http.ReadResponse(upstreamBuf, httpReq)
+	if err != nil {
+		errorResponse(http.StatusBadGateway, "websocket: "+err.Error()).Write(clientConn)
+		return
+	}
+
+	// Forward the response to the client.
+	resp.Write(clientConn)
+
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		resp.Body.Close()
+		return // Upgrade rejected; connection is done.
+	}
+
+	slog.Debug("MITM websocket upgrade", "host", host)
+
+	// Bidirectional relay. Both bufio.Readers may hold buffered bytes from
+	// the HTTP parsing, so we read from them (which drain the buffer first,
+	// then read from the underlying conn).
+	done := make(chan struct{}, 2)
+	go func() { io.Copy(upstreamConn, clientBuf); done <- struct{}{} }()
+	go func() { io.Copy(clientConn, upstreamBuf); done <- struct{}{} }()
+	<-done
 }
 
 // serveH2 handles HTTP/2 streams on the MITM'd TLS connection.

@@ -23,11 +23,19 @@ package proxygatewayclient_test
 import (
 	"bufio"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	crand "crypto/rand"
+	"crypto/sha1"
 	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"net/url"
@@ -843,6 +851,339 @@ source_type = "none"
 		t.Fatalf("expected non-empty ja3_hash (full response: %s)", body)
 	}
 	t.Logf("ja3_hash=%s  ja4=%s", result.Fingerprint.JA3Hash, result.Fingerprint.JA4)
+}
+
+// TestE2E_HTTPCloak_WebSocket_MITM verifies that WebSocket upgrades work
+// through the MITM proxy with httpcloak fingerprint spoofing. The test:
+//  1. Starts a TLS WebSocket echo server (self-signed cert)
+//  2. Starts proxy-gateway with httpcloak MITM
+//  3. Client does CONNECT → MITM terminates TLS → sends Upgrade: websocket
+//  4. MITM detects upgrade, dials upstream with fingerprinted utls, relays
+//  5. Client sends a WebSocket text frame, expects it echoed back
+func TestE2E_HTTPCloak_WebSocket_MITM(t *testing.T) {
+	// --- WebSocket echo server (TLS, self-signed) ---
+	wsAddr := startWebSocketEchoServer(t)
+
+	// --- proxy-gateway ---
+	tmpDir := t.TempDir()
+	gatewayHTTPAddr := freeAddr(t)
+	cfg := fmt.Sprintf(`
+bind_addr = %q
+log_level = "warn"
+
+[[proxy_set]]
+name        = "direct"
+source_type = "none"
+`, gatewayHTTPAddr)
+
+	cfgFile := filepath.Join(tmpDir, "config.toml")
+	if err := os.WriteFile(cfgFile, []byte(cfg), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	binPath := filepath.Join(tmpDir, "proxy-gateway-server")
+	buildCmd := exec.Command("go", "build", "-o", binPath, ".")
+	buildCmd.Dir = filepath.Join(repoRoot(t), "proxy-gateway")
+	buildCmd.Stdout = os.Stderr
+	buildCmd.Stderr = os.Stderr
+	if err := buildCmd.Run(); err != nil {
+		t.Fatalf("build proxy-gateway: %v", err)
+	}
+
+	gwCmd := exec.Command(binPath, cfgFile)
+	gwCmd.Env = append(os.Environ(), "PROXY_MITM_INSECURE_UPSTREAM=true")
+	gwCmd.Stdout = os.Stderr
+	gwCmd.Stderr = os.Stderr
+	if err := gwCmd.Start(); err != nil {
+		t.Fatalf("start proxy-gateway: %v", err)
+	}
+	defer gwCmd.Process.Kill() //nolint:errcheck
+	waitReady(t, gatewayHTTPAddr, 5*time.Second)
+
+	// --- WebSocket handshake through proxy-gateway ---
+	usernameJSON := `{"set":"direct","httpcloak":"chrome-latest"}`
+	username := base64.StdEncoding.EncodeToString([]byte(usernameJSON))
+	creds := base64.StdEncoding.EncodeToString([]byte(username + ":x"))
+
+	// 1. CONNECT to proxy-gateway
+	gwConn, err := net.DialTimeout("tcp", gatewayHTTPAddr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial gateway: %v", err)
+	}
+	defer gwConn.Close()
+	gwConn.SetDeadline(time.Now().Add(15 * time.Second))
+
+	fmt.Fprintf(gwConn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\nProxy-Authorization: Basic %s\r\n\r\n",
+		wsAddr, wsAddr, creds)
+
+	br := bufio.NewReader(gwConn)
+	statusLine, err := br.ReadString('\n')
+	if err != nil {
+		t.Fatalf("reading CONNECT status: %v", err)
+	}
+	if !strings.Contains(statusLine, "200") {
+		t.Fatalf("CONNECT failed: %s", strings.TrimSpace(statusLine))
+	}
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			t.Fatalf("draining CONNECT headers: %v", err)
+		}
+		if strings.TrimSpace(line) == "" {
+			break
+		}
+	}
+
+	// 2. TLS handshake (MITM will intercept)
+	tlsConn := tls.Client(newBufConn(gwConn, br), &tls.Config{
+		InsecureSkipVerify: true, //nolint:gosec
+		ServerName:         "localhost",
+	})
+	if err := tlsConn.Handshake(); err != nil {
+		t.Fatalf("TLS handshake: %v", err)
+	}
+
+	// 3. Send WebSocket upgrade request
+	wsKey := base64.StdEncoding.EncodeToString([]byte("test-websocket-key!"))
+	fmt.Fprintf(tlsConn, "GET /ws HTTP/1.1\r\n"+
+		"Host: %s\r\n"+
+		"Upgrade: websocket\r\n"+
+		"Connection: Upgrade\r\n"+
+		"Sec-WebSocket-Key: %s\r\n"+
+		"Sec-WebSocket-Version: 13\r\n"+
+		"\r\n", wsAddr, wsKey)
+
+	// 4. Read upgrade response
+	tlsBr := bufio.NewReader(tlsConn)
+	upgradeStatus, err := tlsBr.ReadString('\n')
+	if err != nil {
+		t.Fatalf("reading upgrade status: %v", err)
+	}
+	if !strings.Contains(upgradeStatus, "101") {
+		t.Fatalf("expected 101 Switching Protocols, got: %s", strings.TrimSpace(upgradeStatus))
+	}
+	t.Logf("upgrade response: %s", strings.TrimSpace(upgradeStatus))
+	for {
+		line, err := tlsBr.ReadString('\n')
+		if err != nil {
+			t.Fatalf("draining upgrade headers: %v", err)
+		}
+		if strings.TrimSpace(line) == "" {
+			break
+		}
+	}
+
+	// 5. Send a WebSocket text frame and read the echo
+	message := []byte("hello from proxy-gateway e2e test")
+	wsWriteTextFrame(tlsConn, message)
+
+	opcode, payload := wsReadFrame(t, tlsBr)
+	if opcode != 1 { // 1 = text frame
+		t.Fatalf("expected text frame (opcode 1), got opcode %d", opcode)
+	}
+	if string(payload) != string(message) {
+		t.Fatalf("expected echo %q, got %q", message, payload)
+	}
+	t.Logf("WebSocket echo OK: %q", payload)
+}
+
+// startWebSocketEchoServer starts a TLS server that accepts WebSocket upgrades
+// and echoes back any received frames. Returns the host:port address.
+func startWebSocketEchoServer(t *testing.T) string {
+	t.Helper()
+
+	// Generate self-signed cert.
+	ca, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ws echo listen: %v", err)
+	}
+	addr := ca.Addr().String()
+	ca.Close()
+
+	// Use exec to generate a self-signed cert inline via Go.
+	// Simpler: reuse proxykit.NewCA() pattern but we don't import it in the test.
+	// Instead, use crypto/tls.X509KeyPair with a generated cert.
+	certPEM, keyPEM := generateSelfSignedCert(t)
+	cert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		t.Fatalf("parse cert: %v", err)
+	}
+
+	tlsConfig := &tls.Config{Certificates: []tls.Certificate{cert}}
+	ln, err := tls.Listen("tcp", addr, tlsConfig)
+	if err != nil {
+		t.Fatalf("ws echo tls listen: %v", err)
+	}
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go handleWebSocketConn(conn)
+		}
+	}()
+	t.Cleanup(func() { ln.Close() })
+	return addr
+}
+
+func handleWebSocketConn(conn net.Conn) {
+	defer conn.Close()
+	br := bufio.NewReader(conn)
+
+	// Read HTTP upgrade request.
+	req, err := http.ReadRequest(br)
+	if err != nil {
+		return
+	}
+	if !strings.EqualFold(req.Header.Get("Upgrade"), "websocket") {
+		fmt.Fprintf(conn, "HTTP/1.1 400 Bad Request\r\n\r\n")
+		return
+	}
+
+	// Compute Sec-WebSocket-Accept.
+	key := req.Header.Get("Sec-WebSocket-Key")
+	accept := computeWebSocketAccept(key)
+
+	fmt.Fprintf(conn, "HTTP/1.1 101 Switching Protocols\r\n"+
+		"Upgrade: websocket\r\n"+
+		"Connection: Upgrade\r\n"+
+		"Sec-WebSocket-Accept: %s\r\n"+
+		"\r\n", accept)
+
+	// Echo frames.
+	for {
+		opcode, payload, err := wsReadFrameRaw(br)
+		if err != nil {
+			return
+		}
+		if opcode == 8 { // close
+			return
+		}
+		wsWriteTextFrame(conn, payload)
+		_ = opcode
+	}
+}
+
+func computeWebSocketAccept(key string) string {
+	h := sha1.New()
+	h.Write([]byte(key + "258EAFA5-E914-47DA-95CA-5AB5DC11BE65"))
+	return base64.StdEncoding.EncodeToString(h.Sum(nil))
+}
+
+// wsWriteTextFrame writes a minimal unmasked WebSocket text frame.
+func wsWriteTextFrame(w io.Writer, payload []byte) {
+	frame := []byte{0x81} // FIN + text opcode
+	if len(payload) < 126 {
+		frame = append(frame, byte(len(payload)))
+	} else {
+		frame = append(frame, 126, byte(len(payload)>>8), byte(len(payload)))
+	}
+	frame = append(frame, payload...)
+	w.Write(frame) //nolint:errcheck
+}
+
+// wsReadFrame reads a WebSocket frame, handling masking.
+func wsReadFrame(t *testing.T, r *bufio.Reader) (opcode byte, payload []byte) {
+	t.Helper()
+	op, p, err := wsReadFrameRaw(r)
+	if err != nil {
+		t.Fatalf("reading websocket frame: %v", err)
+	}
+	return op, p
+}
+
+func wsReadFrameRaw(r *bufio.Reader) (opcode byte, payload []byte, err error) {
+	b0, err := r.ReadByte()
+	if err != nil {
+		return 0, nil, err
+	}
+	opcode = b0 & 0x0F
+
+	b1, err := r.ReadByte()
+	if err != nil {
+		return 0, nil, err
+	}
+	masked := b1&0x80 != 0
+	length := int(b1 & 0x7F)
+
+	if length == 126 {
+		var buf [2]byte
+		if _, err := io.ReadFull(r, buf[:]); err != nil {
+			return 0, nil, err
+		}
+		length = int(buf[0])<<8 | int(buf[1])
+	} else if length == 127 {
+		var buf [8]byte
+		if _, err := io.ReadFull(r, buf[:]); err != nil {
+			return 0, nil, err
+		}
+		length = int(buf[4])<<24 | int(buf[5])<<16 | int(buf[6])<<8 | int(buf[7])
+	}
+
+	var mask [4]byte
+	if masked {
+		if _, err := io.ReadFull(r, mask[:]); err != nil {
+			return 0, nil, err
+		}
+	}
+
+	payload = make([]byte, length)
+	if _, err := io.ReadFull(r, payload); err != nil {
+		return 0, nil, err
+	}
+	if masked {
+		for i := range payload {
+			payload[i] ^= mask[i%4]
+		}
+	}
+	return opcode, payload, nil
+}
+
+// generateSelfSignedCert returns PEM-encoded cert and key for testing.
+func generateSelfSignedCert(t *testing.T) (certPEM, keyPEM []byte) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), crand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serial, _ := crand.Int(crand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	tmpl := &x509.Certificate{
+		SerialNumber: serial,
+		Subject:      pkix.Name{CommonName: "localhost"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:     []string{"localhost"},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+	}
+	certDER, err := x509.CreateCertificate(crand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPEM = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPEM = pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+	return
+}
+
+// bufConn wraps a net.Conn with a bufio.Reader to drain buffered bytes first.
+type bufConn struct {
+	net.Conn
+	r *bufio.Reader
+}
+
+func newBufConn(conn net.Conn, r *bufio.Reader) *bufConn {
+	return &bufConn{Conn: conn, r: r}
+}
+
+func (c *bufConn) Read(p []byte) (int, error) {
+	return c.r.Read(p)
 }
 
 func TestE2E_LeastUsedRotation_SpreadAcrossUpstreams(t *testing.T) {
