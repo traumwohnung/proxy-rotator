@@ -42,6 +42,7 @@ import (
 
 	"github.com/sardanioss/httpcloak"
 	proxygatewayclient "github.com/traumwohnung/proxy-gateway/proxy-gateway-client-go"
+	"golang.org/x/net/http2"
 )
 
 // ---------------------------------------------------------------------------
@@ -740,6 +741,108 @@ source_type = "none"
 		}
 		seen[ja4] = preset
 	}
+}
+
+// TestE2E_HTTPCloak_H2_MITM verifies that the MITM proxy serves HTTP/2 to
+// clients that negotiate H2 via ALPN. The client connects through the gateway
+// with httpcloak fingerprint spoofing and forces H2 on the client-facing side.
+func TestE2E_HTTPCloak_H2_MITM(t *testing.T) {
+	echoURL, stopEcho := startFingerprintEchoServer(t)
+	defer stopEcho()
+
+	tmpDir := t.TempDir()
+	gatewayHTTPAddr := freeAddr(t)
+	cfg := fmt.Sprintf(`
+bind_addr = %q
+log_level = "warn"
+
+[[proxy_set]]
+name        = "direct"
+source_type = "none"
+`, gatewayHTTPAddr)
+
+	cfgFile := filepath.Join(tmpDir, "config.toml")
+	if err := os.WriteFile(cfgFile, []byte(cfg), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	binPath := filepath.Join(tmpDir, "proxy-gateway-server")
+	buildCmd := exec.Command("go", "build", "-o", binPath, ".")
+	buildCmd.Dir = filepath.Join(repoRoot(t), "proxy-gateway")
+	buildCmd.Stdout = os.Stderr
+	buildCmd.Stderr = os.Stderr
+	if err := buildCmd.Run(); err != nil {
+		t.Fatalf("build proxy-gateway: %v", err)
+	}
+
+	gwCmd := exec.Command(binPath, cfgFile)
+	gwCmd.Env = append(os.Environ(), "PROXY_MITM_INSECURE_UPSTREAM=true")
+	gwCmd.Stdout = os.Stderr
+	gwCmd.Stderr = os.Stderr
+	if err := gwCmd.Start(); err != nil {
+		t.Fatalf("start proxy-gateway: %v", err)
+	}
+	defer gwCmd.Process.Kill() //nolint:errcheck
+
+	waitReady(t, gatewayHTTPAddr, 5*time.Second)
+
+	usernameJSON := `{"set":"direct","httpcloak":"chrome-latest"}`
+	username := base64.StdEncoding.EncodeToString([]byte(usernameJSON))
+
+	proxyRawURL := "http://" + gatewayHTTPAddr
+	pu, _ := url.Parse(proxyRawURL)
+	pu.User = url.UserPassword(username, "x")
+
+	// Force H2 on the client-facing MITM connection.
+	transport := &http.Transport{
+		Proxy: http.ProxyURL(pu),
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true, //nolint:gosec
+			NextProtos:         []string{"h2", "http/1.1"},
+		},
+		ForceAttemptHTTP2: true,
+	}
+	// Configure H2 on the transport.
+	if err := http2.ConfigureTransport(transport); err != nil {
+		t.Fatalf("configure h2 transport: %v", err)
+	}
+
+	httpClient := &http.Client{
+		Transport: transport,
+		Timeout:   30 * time.Second,
+	}
+
+	resp, err := httpClient.Get(echoURL + "/")
+	if err != nil {
+		t.Fatalf("H2 request through gateway: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Verify we actually got H2 on the client side.
+	t.Logf("response proto: %s", resp.Proto)
+	if resp.ProtoMajor != 2 {
+		t.Errorf("expected HTTP/2 on client side, got %s", resp.Proto)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading response body: %v", err)
+	}
+
+	var result fingerprintEchoResponse
+	if err := json.Unmarshal(body, &result); err != nil {
+		t.Fatalf("parsing response %q: %v", body, err)
+	}
+
+	if result.Fingerprint.JA3Hash == "" {
+		t.Fatalf("expected non-empty ja3_hash (full response: %s)", body)
+	}
+	t.Logf("ja3_hash=%s  ja4=%s", result.Fingerprint.JA3Hash, result.Fingerprint.JA4)
 }
 
 func TestE2E_LeastUsedRotation_SpreadAcrossUpstreams(t *testing.T) {

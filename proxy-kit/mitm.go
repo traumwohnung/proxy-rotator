@@ -18,6 +18,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/net/http2"
 )
 
 // ---------------------------------------------------------------------------
@@ -217,6 +219,7 @@ func (m *mitmHandler) Resolve(ctx context.Context, req *Request) (*Result, error
 
 	tlsConn := tls.Server(req.Conn, &tls.Config{
 		Certificates: []tls.Certificate{*cert},
+		NextProtos:   []string{"h2", "http/1.1"},
 	})
 	if err := tlsConn.Handshake(); err != nil {
 		slog.Debug("MITM TLS handshake failed", "host", host, "err", err)
@@ -224,13 +227,26 @@ func (m *mitmHandler) Resolve(ctx context.Context, req *Request) (*Result, error
 		return nil, nil
 	}
 
-	slog.Debug("MITM intercepting", "host", host)
+	negotiated := tlsConn.ConnectionState().NegotiatedProtocol
+	slog.Debug("MITM intercepting", "host", host, "proto", negotiated)
 
 	childCtx := WithTLSState(ctx, TLSState{
 		Broken:     true,
 		ServerName: host,
 	})
 
+	if negotiated == "h2" {
+		m.serveH2(childCtx, tlsConn, req, host)
+	} else {
+		m.serveH1(childCtx, tlsConn, req, host)
+	}
+
+	tlsConn.Close()
+	return nil, nil
+}
+
+// serveH1 handles HTTP/1.1 requests on the MITM'd TLS connection.
+func (m *mitmHandler) serveH1(ctx context.Context, tlsConn *tls.Conn, outerReq *Request, host string) {
 	br := bufio.NewReader(tlsConn)
 	for {
 		httpReq, err := http.ReadRequest(br)
@@ -238,47 +254,84 @@ func (m *mitmHandler) Resolve(ctx context.Context, req *Request) (*Result, error
 			break
 		}
 
-		childReq := &Request{
-			RawUsername: req.RawUsername,
-			RawPassword: req.RawPassword,
-			Target:      host + ":443",
-			HTTPRequest: httpReq,
-		}
-
-		result, resolveErr := m.inner.Resolve(childCtx, childReq)
-
-		// Synthetic response from pipeline middleware.
-		if result != nil && result.HTTPResponse != nil {
-			result.HTTPResponse.Write(tlsConn)
-			continue
-		}
-
-		if resolveErr != nil {
-			writeErrorResponse(tlsConn, http.StatusForbidden, resolveErr.Error())
-			continue
-		}
-		if result == nil || result.Proxy == nil {
-			writeErrorResponse(tlsConn, http.StatusServiceUnavailable, "no proxy available")
-			continue
-		}
-
-		// Forward through the interceptor.
-		resp, fwdErr := m.interceptor.RoundTrip(childCtx, httpReq, host, result.Proxy)
-		if fwdErr != nil {
-			writeErrorResponse(tlsConn, http.StatusBadGateway, fwdErr.Error())
-			continue
-		}
-
-		// Pipeline response hooks.
-		if result.ResponseHook != nil {
-			resp = result.ResponseHook(resp)
-		}
-
+		resp := m.roundTripMITM(ctx, httpReq, outerReq, host)
 		resp.Write(tlsConn)
+		resp.Body.Close()
+	}
+}
+
+// serveH2 handles HTTP/2 streams on the MITM'd TLS connection.
+func (m *mitmHandler) serveH2(ctx context.Context, tlsConn *tls.Conn, outerReq *Request, host string) {
+	h2srv := &http2.Server{}
+	h2srv.ServeConn(tlsConn, &http2.ServeConnOpts{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			resp := m.roundTripMITM(ctx, r, outerReq, host)
+			copyResponse(w, resp)
+			resp.Body.Close()
+		}),
+	})
+}
+
+// roundTripMITM resolves the upstream proxy and forwards the request through
+// the interceptor. Used by both H1 and H2 paths.
+func (m *mitmHandler) roundTripMITM(ctx context.Context, httpReq *http.Request, outerReq *Request, host string) *http.Response {
+	childReq := &Request{
+		RawUsername:  outerReq.RawUsername,
+		RawPassword: outerReq.RawPassword,
+		Target:      host + ":443",
+		HTTPRequest: httpReq,
 	}
 
-	tlsConn.Close()
-	return nil, nil
+	result, resolveErr := m.inner.Resolve(ctx, childReq)
+
+	if result != nil && result.HTTPResponse != nil {
+		return result.HTTPResponse
+	}
+	if resolveErr != nil {
+		return errorResponse(http.StatusForbidden, resolveErr.Error())
+	}
+	if result == nil || result.Proxy == nil {
+		return errorResponse(http.StatusServiceUnavailable, "no proxy available")
+	}
+
+	resp, fwdErr := m.interceptor.RoundTrip(ctx, httpReq, host, result.Proxy)
+	if fwdErr != nil {
+		return errorResponse(http.StatusBadGateway, fwdErr.Error())
+	}
+
+	if result.ResponseHook != nil {
+		resp = result.ResponseHook(resp)
+	}
+	return resp
+}
+
+// copyResponse writes an *http.Response to an http.ResponseWriter, flushing
+// after each chunk to support streaming (SSE, chunked responses) over H2.
+func copyResponse(w http.ResponseWriter, resp *http.Response) {
+	for k, vs := range resp.Header {
+		for _, v := range vs {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	if resp.Body == nil {
+		return
+	}
+	if flusher, ok := w.(http.Flusher); ok {
+		buf := make([]byte, 32*1024)
+		for {
+			n, err := resp.Body.Read(buf)
+			if n > 0 {
+				w.Write(buf[:n])
+				flusher.Flush()
+			}
+			if err != nil {
+				break
+			}
+		}
+	} else {
+		io.Copy(w, resp.Body)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -293,17 +346,17 @@ func targetHost(target string) string {
 	return h
 }
 
-func writeErrorResponse(w io.Writer, status int, msg string) {
-	resp := &http.Response{
-		StatusCode: status,
-		Status:     fmt.Sprintf("%d %s", status, http.StatusText(status)),
-		Proto:      "HTTP/1.1",
-		ProtoMajor: 1,
-		ProtoMinor: 1,
-		Header:     http.Header{"Content-Type": {"text/plain"}},
-		Body:       io.NopCloser(strings.NewReader(msg)),
+func errorResponse(status int, msg string) *http.Response {
+	return &http.Response{
+		StatusCode:    status,
+		Status:        fmt.Sprintf("%d %s", status, http.StatusText(status)),
+		Proto:         "HTTP/1.1",
+		ProtoMajor:    1,
+		ProtoMinor:    1,
+		Header:        http.Header{"Content-Type": {"text/plain"}},
+		Body:          io.NopCloser(strings.NewReader(msg)),
+		ContentLength: int64(len(msg)),
 	}
-	resp.Write(w)
 }
 
 // ---------------------------------------------------------------------------

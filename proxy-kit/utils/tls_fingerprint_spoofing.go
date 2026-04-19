@@ -164,7 +164,6 @@ func (f *tlsFingerprintInterceptor) RoundTrip(ctx context.Context, httpReq *http
 	opts := f.spec.sessionOptions(proxyURL, f.insecure)
 
 	session := httpcloak.NewSession(f.spec.Preset, opts...)
-	defer session.Close()
 
 	// Prefer httpReq.Host for the target URL: it preserves non-standard ports
 	// (e.g. localhost:8443) that the MITM's targetHost() would strip.
@@ -194,10 +193,10 @@ func (f *tlsFingerprintInterceptor) RoundTrip(ctx context.Context, httpReq *http
 
 	resp, err := session.Do(ctx, cloakReq)
 	if err != nil {
+		session.Close()
 		return nil, fmt.Errorf("httpcloak %s: %w", targetURL, err)
 	}
 
-	body, _ := resp.Bytes()
 	httpResp := &http.Response{
 		StatusCode:    resp.StatusCode,
 		Status:        fmt.Sprintf("%d %s", resp.StatusCode, http.StatusText(resp.StatusCode)),
@@ -205,18 +204,36 @@ func (f *tlsFingerprintInterceptor) RoundTrip(ctx context.Context, httpReq *http
 		ProtoMajor:    1,
 		ProtoMinor:    1,
 		Header:        make(http.Header),
-		Body:          io.NopCloser(strings.NewReader(string(body))),
-		ContentLength: int64(len(body)),
+		Body:          &sessionClosingBody{ReadCloser: resp.Body, session: session},
+		ContentLength: -1,
 	}
 	for k, vs := range resp.Headers {
 		for _, v := range vs {
 			httpResp.Header.Add(k, v)
 		}
 	}
-	// Ensure Content-Length is consistent with the body we buffered so that
-	// the MITM loop can keep the client connection alive across requests.
-	httpResp.Header.Set("Content-Length", fmt.Sprintf("%d", len(body)))
+	// Preserve upstream Content-Length when present so the MITM loop can
+	// keep the client connection alive across HTTP/1.1 keep-alive requests.
+	if cl := httpResp.Header.Get("Content-Length"); cl != "" {
+		fmt.Sscanf(cl, "%d", &httpResp.ContentLength)
+	}
+	// Remove Transfer-Encoding — Go's resp.Write will set it based on ContentLength.
+	httpResp.Header.Del("Transfer-Encoding")
 	return httpResp, nil
+}
+
+// sessionClosingBody wraps the httpcloak response body and closes the
+// httpcloak session when the body is closed. This ties the session lifetime
+// to the body consumption, enabling streaming without buffering.
+type sessionClosingBody struct {
+	io.ReadCloser
+	session *httpcloak.Session
+}
+
+func (b *sessionClosingBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.session.Close()
+	return err
 }
 
 // ---------------------------------------------------------------------------
