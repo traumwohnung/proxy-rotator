@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log/slog"
 
 	db "proxy-gateway/db/gen"
 	proxykit "proxy-kit"
@@ -25,7 +26,17 @@ func BuildServer(cfg *Config, configDir string, proxyPassword string, tracker *U
 	}
 
 	sessions := utils.NewSessionManager(router)
-	pipeline := PasswordAuth(proxyPassword, ParseJSONCreds(trackUsage(tracker, sessions)))
+	inner := trackUsage(tracker, sessions)
+
+	// Generate a MITM CA for optional per-request httpcloak fingerprint spoofing.
+	ca, err := proxykit.NewCA()
+	if err != nil {
+		return nil, fmt.Errorf("generating MITM CA: %w", err)
+	}
+	slog.Info("MITM CA generated (used when httpcloak preset is set in username)")
+
+	conditionalMITM := utils.ConditionalFingerprintMITM(ca, getHTTPCloakSpec, inner)
+	pipeline := PasswordAuth(proxyPassword, ParseJSONCreds(conditionalMITM))
 
 	return &Server{
 		Pipeline: pipeline,
@@ -85,8 +96,11 @@ func buildProxysetRouter(cfg *Config, configDir string) (proxykit.Handler, error
 			}
 			src, err = utils.NewWebshareSource(raw.Webshare)
 
+		case "none":
+			src = utils.NewNoneSource()
+
 		default:
-			return nil, fmt.Errorf("proxy set %q: unknown source type %q (supported: static_file, bottingtools, geonode, proxyingio, webshare)", raw.Name, raw.SourceType)
+			return nil, fmt.Errorf("proxy set %q: unknown source type %q (supported: static_file, bottingtools, geonode, proxyingio, webshare, none)", raw.Name, raw.SourceType)
 		}
 
 		if err != nil {

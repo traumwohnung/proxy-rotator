@@ -12,3 +12,11 @@ services:
     environment:
       - LOG_LEVEL=info
     restart: unless-stopped
+
+  tls-fingerprint-echo:
+    build:
+      context: ../tls-fingerprint-echo
+      dockerfile: Dockerfile
+    ports:
+      - "8443:8443"
+    restart: unless-stopped

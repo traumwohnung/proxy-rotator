@@ -171,7 +171,12 @@ func (d *HTTPDownstream) serveConnect(w http.ResponseWriter, r *http.Request, ra
 		if result == nil || result.Proxy == nil {
 			return // handler fully managed the connection (e.g. MITM)
 		}
-		upstreamConn, err := d.Upstream.Dial(r.Context(), result.Proxy, r.Host)
+		var upstreamConn net.Conn
+		if result.Proxy.Host == "" {
+			upstreamConn, err = dialDirect(r.Context(), r.Host)
+		} else {
+			upstreamConn, err = d.Upstream.Dial(r.Context(), result.Proxy, r.Host)
+		}
 		if err != nil {
 			slog.Error("upstream dial failed", "target", r.Host, "err", err)
 			if result.ConnTracker != nil {
@@ -180,11 +185,15 @@ func (d *HTTPDownstream) serveConnect(w http.ResponseWriter, r *http.Request, ra
 			return
 		}
 		defer upstreamConn.Close()
-		slog.Info("tunneling",
-			"target", r.Host,
-			"upstream", fmt.Sprintf("%s:%d", result.Proxy.Host, result.Proxy.Port),
-			"upstream_proto", result.Proxy.Proto(),
-		)
+		if result.Proxy.Host == "" {
+			slog.Info("tunneling", "target", r.Host, "upstream", "direct")
+		} else {
+			slog.Info("tunneling",
+				"target", r.Host,
+				"upstream", fmt.Sprintf("%s:%d", result.Proxy.Host, result.Proxy.Port),
+				"upstream_proto", result.Proxy.Proto(),
+			)
+		}
 		sent, received := relay(clientConn, upstreamConn, result.ConnTracker)
 		if result.ConnTracker != nil {
 			result.ConnTracker.Close(sent, received)
@@ -200,7 +209,13 @@ func (d *HTTPDownstream) serveConnect(w http.ResponseWriter, r *http.Request, ra
 	// Phase 2: dial the upstream before hijacking so we can still return an
 	// HTTP error response if the upstream is unreachable.
 	proxy := result.Proxy
-	upstreamConn, err := d.Upstream.Dial(r.Context(), proxy, r.Host)
+	var upstreamConn net.Conn
+	if proxy.Host == "" {
+		// Direct connection: no upstream proxy, connect straight to target.
+		upstreamConn, err = dialDirect(r.Context(), r.Host)
+	} else {
+		upstreamConn, err = d.Upstream.Dial(r.Context(), proxy, r.Host)
+	}
 	if err != nil {
 		slog.Error("upstream dial failed", "target", r.Host, "err", err)
 		if result.ConnTracker != nil {
@@ -236,11 +251,15 @@ func (d *HTTPDownstream) serveConnect(w http.ResponseWriter, r *http.Request, ra
 	defer clientConn.Close()
 	defer upstreamConn.Close()
 
-	slog.Info("tunneling",
-		"target", r.Host,
-		"upstream", fmt.Sprintf("%s:%d", proxy.Host, proxy.Port),
-		"upstream_proto", proxy.Proto(),
-	)
+	if proxy.Host == "" {
+		slog.Info("tunneling", "target", r.Host, "upstream", "direct")
+	} else {
+		slog.Info("tunneling",
+			"target", r.Host,
+			"upstream", fmt.Sprintf("%s:%d", proxy.Host, proxy.Port),
+			"upstream_proto", proxy.Proto(),
+		)
+	}
 
 	sent, received := relay(clientConn, upstreamConn, result.ConnTracker)
 	if result.ConnTracker != nil {
@@ -283,11 +302,15 @@ func (d *HTTPDownstream) servePlainHTTP(w http.ResponseWriter, r *http.Request, 
 	}
 
 	proxy := result.Proxy
-	slog.Info("forwarding",
-		"method", r.Method,
-		"uri", r.RequestURI,
-		"upstream", fmt.Sprintf("%s:%d", proxy.Host, proxy.Port),
-	)
+	if proxy.Host == "" {
+		slog.Info("forwarding", "method", r.Method, "uri", r.RequestURI, "upstream", "direct")
+	} else {
+		slog.Info("forwarding",
+			"method", r.Method,
+			"uri", r.RequestURI,
+			"upstream", fmt.Sprintf("%s:%d", proxy.Host, proxy.Port),
+		)
+	}
 
 	resp, err := ForwardPlainHTTP(r, proxy)
 	if err != nil {
@@ -331,6 +354,12 @@ func (d *HTTPDownstream) servePlainHTTP(w http.ResponseWriter, r *http.Request, 
 		result.ConnTracker.RecordTraffic(false, received, func() {})
 		result.ConnTracker.Close(sent, received)
 	}
+}
+
+// dialDirect opens a TCP connection straight to target (no upstream proxy).
+func dialDirect(ctx context.Context, target string) (net.Conn, error) {
+	d := &net.Dialer{Timeout: DefaultUpstreamDialTimeout}
+	return d.DialContext(ctx, "tcp", target)
 }
 
 // ListenHTTP starts a standalone HTTP proxy on addr with default settings.

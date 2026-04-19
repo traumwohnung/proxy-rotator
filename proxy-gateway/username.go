@@ -14,10 +14,13 @@ import (
 // Username is the parsed proxy-gateway username JSON.
 //
 //	{"set":"residential", "minutes":5, "meta":{"platform":"myapp","user":"alice"}}
+//	{"set":"direct", "httpcloak":"chrome-latest"}
+//	{"set":"direct", "httpcloak":{"preset":"chrome-latest","ja3":"771,...","akamai":"1:65536|..."}}
 type Username struct {
-	Affinity AffinityParams
-	Minutes  int
-	Raw      string // original JSON string, stored as session label
+	Affinity  AffinityParams
+	Minutes   int
+	Httpcloak *utils.HTTPCloakSpec // optional; triggers MITM + TLS fingerprint spoofing
+	Raw       string               // original JSON string, stored as session label
 }
 
 // ParseUsername parses a raw JSON username string.
@@ -35,9 +38,10 @@ func ParseUsername(raw string) (*Username, error) {
 		jsonBytes = decoded
 	}
 	var j struct {
-		Set     string                 `json:"set"`
-		Minutes int                    `json:"minutes"`
-		Meta    map[string]interface{} `json:"meta"`
+		Set      string                 `json:"set"`
+		Minutes  int                    `json:"minutes"`
+		Meta     map[string]interface{} `json:"meta"`
+		Httpcloak json.RawMessage       `json:"httpcloak"`
 	}
 	if err := json.Unmarshal(jsonBytes, &j); err != nil {
 		return nil, fmt.Errorf("username is not valid JSON: %w", err)
@@ -45,10 +49,15 @@ func ParseUsername(raw string) (*Username, error) {
 	if j.Set == "" {
 		return nil, fmt.Errorf("'set' must not be empty")
 	}
+	spec, err := utils.ParseHTTPCloakSpec(j.Httpcloak)
+	if err != nil {
+		return nil, fmt.Errorf("httpcloak: %w", err)
+	}
 	return &Username{
-		Affinity: AffinityParams{Set: j.Set, Meta: j.Meta},
-		Minutes:  j.Minutes,
-		Raw:      string(jsonBytes),
+		Affinity:  AffinityParams{Set: j.Set, Meta: j.Meta},
+		Minutes:   j.Minutes,
+		Httpcloak: spec,
+		Raw:       string(jsonBytes),
 	}, nil
 }
 
@@ -61,6 +70,7 @@ type ctxKey int
 const (
 	ctxSet ctxKey = iota
 	ctxAffinityJSON
+	ctxHTTPCloakPreset
 )
 
 func withSet(ctx context.Context, set string) context.Context {
@@ -78,6 +88,15 @@ func withAffinityJSON(ctx context.Context, json string) context.Context {
 
 func getAffinityJSON(ctx context.Context) string {
 	v, _ := ctx.Value(ctxAffinityJSON).(string)
+	return v
+}
+
+func withHTTPCloakSpec(ctx context.Context, spec *utils.HTTPCloakSpec) context.Context {
+	return context.WithValue(ctx, ctxHTTPCloakPreset, spec)
+}
+
+func getHTTPCloakSpec(ctx context.Context) *utils.HTTPCloakSpec {
+	v, _ := ctx.Value(ctxHTTPCloakPreset).(*utils.HTTPCloakSpec)
 	return v
 }
 
@@ -102,6 +121,7 @@ func ParseJSONCreds(next proxykit.Handler) proxykit.Handler {
 		ctx = utils.WithSeedTTL(ctx, time.Duration(u.Minutes)*time.Minute)
 		ctx = utils.WithTopLevelSeed(ctx, u.Affinity.Seed())
 		ctx = utils.WithSessionLabel(ctx, u.Raw)
+		ctx = withHTTPCloakSpec(ctx, u.Httpcloak)
 
 		return next.Resolve(ctx, req)
 	})
