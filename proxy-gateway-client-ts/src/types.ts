@@ -127,9 +127,6 @@ export interface HTTPCloakSpec {
     akamai?: string;
 }
 
-/** HTTPCloak option: either a preset name string or a full spec object. */
-export type HTTPCloakOption = string | HTTPCloakSpec;
-
 // ---------------------------------------------------------------------------
 // Username construction helpers
 // ---------------------------------------------------------------------------
@@ -139,7 +136,7 @@ export interface BuildProxyUsernameOptions {
     affinityMinutes: number;
     metadata: SessionMetadata;
     /** Enable TLS fingerprint spoofing. Pass a preset name or an HTTPCloakSpec. */
-    httpcloak?: HTTPCloakOption;
+    httpcloak?: HTTPCloakSpec;
 }
 
 /**
@@ -194,7 +191,7 @@ export function parseProxyUsername(username: string): {
     proxySet: string;
     affinityMinutes: number;
     metadata: SessionMetadata;
-    httpcloak?: HTTPCloakOption;
+    httpcloak?: HTTPCloakSpec;
 } | null {
     try {
         const json = atob(username);
@@ -213,7 +210,7 @@ export function parseProxyUsername(username: string): {
             proxySet: string;
             affinityMinutes: number;
             metadata: SessionMetadata;
-            httpcloak?: HTTPCloakOption;
+            httpcloak?: HTTPCloakSpec;
         } = {
             proxySet: set,
             affinityMinutes: minutes,

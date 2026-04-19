@@ -15,15 +15,13 @@ type UsernameParams struct {
 	Minutes int `json:"minutes"`
 	// Meta is an arbitrary key/value map that, together with Set, forms the affinity key.
 	Meta map[string]any `json:"meta,omitempty"`
-	// HTTPCloak enables TLS fingerprint spoofing via MITM. Can be a preset name
-	// string (e.g. "chrome-latest") or an HTTPCloakSpec object for fine-grained
-	// control. When set, the proxy-gateway intercepts the TLS connection and
-	// re-establishes it with a browser-like fingerprint.
-	HTTPCloak any `json:"httpcloak,omitempty"`
+	// HTTPCloak enables TLS fingerprint spoofing via MITM. When set, the
+	// proxy-gateway intercepts the TLS connection and re-establishes it with
+	// a browser-like fingerprint.
+	HTTPCloak *HTTPCloakSpec `json:"httpcloak,omitempty"`
 }
 
-// HTTPCloakSpec configures TLS fingerprint spoofing when used as the HTTPCloak
-// field in UsernameParams. For simple cases, pass a preset name string instead.
+// HTTPCloakSpec configures TLS fingerprint spoofing.
 type HTTPCloakSpec struct {
 	// Preset is the browser fingerprint preset (e.g. "chrome-latest", "firefox-latest").
 	Preset string `json:"preset"`
