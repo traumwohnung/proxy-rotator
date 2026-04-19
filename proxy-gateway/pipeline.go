@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 
 	db "proxy-gateway/db/gen"
 	proxykit "proxy-kit"
@@ -28,12 +30,10 @@ func BuildServer(cfg *Config, configDir string, proxyPassword string, tracker *U
 	sessions := utils.NewSessionManager(router)
 	inner := trackUsage(tracker, sessions)
 
-	// Generate a MITM CA for optional per-request httpcloak fingerprint spoofing.
-	ca, err := proxykit.NewCA()
+	ca, err := loadOrGenerateCA(cfg, configDir)
 	if err != nil {
-		return nil, fmt.Errorf("generating MITM CA: %w", err)
+		return nil, err
 	}
-	slog.Info("MITM CA generated (used when httpcloak preset is set in username)")
 
 	conditionalMITM := utils.ConditionalFingerprintMITM(ca, getHTTPCloakSpec, inner)
 	pipeline := PasswordAuth(proxyPassword, ParseJSONCreds(conditionalMITM))
@@ -139,4 +139,31 @@ func trackUsage(tracker *UsageTracker, next proxykit.Handler) proxykit.Handler {
 		result.ConnTracker = proxykit.ChainTrackers(result.ConnTracker, ct)
 		return result, nil
 	})
+}
+
+// loadOrGenerateCA loads a MITM CA from config paths, or generates a new one.
+func loadOrGenerateCA(cfg *Config, configDir string) (tls.Certificate, error) {
+	if cfg.MITMCACert != "" && cfg.MITMCAKey != "" {
+		certPath := cfg.MITMCACert
+		keyPath := cfg.MITMCAKey
+		if !filepath.IsAbs(certPath) {
+			certPath = filepath.Join(configDir, certPath)
+		}
+		if !filepath.IsAbs(keyPath) {
+			keyPath = filepath.Join(configDir, keyPath)
+		}
+		ca, err := tls.LoadX509KeyPair(certPath, keyPath)
+		if err != nil {
+			return tls.Certificate{}, fmt.Errorf("loading MITM CA from %s / %s: %w", certPath, keyPath, err)
+		}
+		slog.Info("MITM CA loaded from file", "cert", certPath, "key", keyPath)
+		return ca, nil
+	}
+
+	ca, err := proxykit.NewCA()
+	if err != nil {
+		return tls.Certificate{}, fmt.Errorf("generating MITM CA: %w", err)
+	}
+	slog.Info("MITM CA generated (no mitm_ca_cert/mitm_ca_key in config)")
+	return ca, nil
 }

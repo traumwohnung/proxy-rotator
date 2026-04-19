@@ -14,6 +14,11 @@
 bind_addr = "0.0.0.0:8100"
 log_level = "info"
 
+# MITM CA for httpcloak TLS fingerprint spoofing.
+# Paths are relative to the config directory.
+mitm_ca_cert = "mitm-ca.crt"
+mitm_ca_key  = "mitm-ca.key"
+
 [[proxy_set]]
 name = "residential"
 source_type = "static_file"

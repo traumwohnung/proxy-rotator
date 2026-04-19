@@ -20,6 +20,12 @@ type Config struct {
 	AdminAddr  string `toml:"admin_addr"  yaml:"admin_addr"  json:"admin_addr"`
 	LogLevel   string `toml:"log_level"  yaml:"log_level"  json:"log_level"`
 
+	// MITMCACert and MITMCAKey are paths to PEM-encoded CA certificate and
+	// private key used for MITM TLS interception (httpcloak fingerprint
+	// spoofing). When omitted, a new CA is generated at startup.
+	MITMCACert string `toml:"mitm_ca_cert" yaml:"mitm_ca_cert" json:"mitm_ca_cert"`
+	MITMCAKey  string `toml:"mitm_ca_key"  yaml:"mitm_ca_key"  json:"mitm_ca_key"`
+
 	ProxySets []ProxySetConfig `toml:"proxy_set" yaml:"proxy_set" json:"proxy_set"`
 }
 
