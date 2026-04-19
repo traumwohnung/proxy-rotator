@@ -23,6 +23,7 @@ package proxygatewayclient_test
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -39,6 +40,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sardanioss/httpcloak"
 	proxygatewayclient "github.com/traumwohnung/proxy-gateway/proxy-gateway-client-go"
 )
 
@@ -508,6 +510,235 @@ func TestE2E_MultipleDistinctSessions(t *testing.T) {
 		if body1["x-forwarded-via"] != body2["x-forwarded-via"] {
 			t.Errorf("user %q changed upstream between requests", u)
 		}
+	}
+}
+
+// fingerprintEchoResponse mirrors the JSON shape returned by tls-fingerprint-echo.
+type fingerprintEchoResponse struct {
+	Fingerprint struct {
+		JA3Hash string `json:"ja3_hash"`
+		JA3Raw  string `json:"ja3_raw"`
+		JA4     string `json:"ja4"`
+	} `json:"fingerprint"`
+	Verdict struct {
+		Level string  `json:"level"`
+		Score float64 `json:"score"`
+	} `json:"verdict"`
+	HTTPCloakPresetMatches []struct {
+		Name      string `json:"name"`
+		UserAgent string `json:"user_agent"`
+	} `json:"httpcloak_preset_matches"`
+}
+
+// directFingerprintRequest makes a direct httpcloak request (no proxy) to the
+// fingerprint echo server and returns the parsed response. Used to derive the
+// expected JA3 for a given preset so we can compare against the proxied path.
+func directFingerprintRequest(t *testing.T, echoURL, preset string) fingerprintEchoResponse {
+	t.Helper()
+	session := httpcloak.NewSession(preset, httpcloak.WithInsecureSkipVerify())
+	defer session.Close()
+
+	resp, err := session.Get(context.Background(), echoURL+"/")
+	if err != nil {
+		t.Fatalf("direct httpcloak GET %s (preset=%s): %v", echoURL, preset, err)
+	}
+	defer resp.Close()
+
+	body, err := resp.Bytes()
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	var result fingerprintEchoResponse
+	if err := json.Unmarshal(body, &result); err != nil {
+		t.Fatalf("parse fingerprint-echo response: %v\nbody: %s", err, body)
+	}
+	return result
+}
+
+// startFingerprintEchoServer builds and starts the tls-fingerprint-echo server
+// from the submodule at tls-fingerprint-echo/cmd/tls-fingerprint-echo.
+// Returns the HTTPS base URL and a stop function.
+func startFingerprintEchoServer(t *testing.T) (baseURL string, stop func()) {
+	t.Helper()
+
+	root := repoRoot(t)
+	tmpDir := t.TempDir()
+
+	echoBin := filepath.Join(tmpDir, "tls-fingerprint-echo")
+	buildCmd := exec.Command("go", "build", "-o", echoBin, ".")
+	buildCmd.Dir = filepath.Join(root, "tls-fingerprint-echo", "cmd", "tls-fingerprint-echo")
+	buildCmd.Stdout = os.Stderr
+	buildCmd.Stderr = os.Stderr
+	if err := buildCmd.Run(); err != nil {
+		t.Fatalf("build tls-fingerprint-echo: %v", err)
+	}
+
+	// Find a free port for the echo server.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("find free port: %v", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	ln.Close()
+
+	cmd := exec.Command(echoBin)
+	cmd.Env = append(os.Environ(), fmt.Sprintf("PORT=%d", port))
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start tls-fingerprint-echo: %v", err)
+	}
+
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	// Wait for TLS readiness (the server serves HTTPS with a self-signed cert).
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		conn, err := tls.DialWithDialer(
+			&net.Dialer{Timeout: 100 * time.Millisecond},
+			"tcp", addr,
+			&tls.Config{InsecureSkipVerify: true}, //nolint:gosec
+		)
+		if err == nil {
+			conn.Close()
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	return fmt.Sprintf("https://localhost:%d", port), func() { cmd.Process.Kill() } //nolint:errcheck
+}
+
+// TestE2E_HTTPCloak_TLSFingerprintEcho verifies that proxy-gateway applies the
+// httpcloak chrome-latest TLS fingerprint when "httpcloak":"chrome-latest" is
+// set in the username JSON.
+//
+// Flow:
+//
+//	Go test client (InsecureSkipVerify for MITM cert)
+//	  → proxy-gateway (MITM + httpcloak <preset>)
+//	    → tls-fingerprint-echo (self-signed cert, PROXY_MITM_INSECURE_UPSTREAM=true)
+//
+// The echo server measures the JA3/JA4 fingerprint of the incoming connection
+// and returns it as JSON. For each preset we compare the JA4 from the proxied
+// path against a direct httpcloak request to verify the gateway applies the
+// correct fingerprint. We also verify that different presets produce distinct
+// JA4 values to ensure we're not silently falling back to Go's default TLS.
+func TestE2E_HTTPCloak_TLSFingerprintEcho(t *testing.T) {
+	echoURL, stopEcho := startFingerprintEchoServer(t)
+	defer stopEcho()
+
+	// Start proxy-gateway with a "none" proxy set (direct to target, no upstream proxy).
+	tmpDir := t.TempDir()
+	gatewayHTTPAddr := freeAddr(t)
+	cfg := fmt.Sprintf(`
+bind_addr = %q
+log_level = "warn"
+
+[[proxy_set]]
+name        = "direct"
+source_type = "none"
+`, gatewayHTTPAddr)
+
+	cfgFile := filepath.Join(tmpDir, "config.toml")
+	if err := os.WriteFile(cfgFile, []byte(cfg), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	binPath := filepath.Join(tmpDir, "proxy-gateway-server")
+	buildCmd := exec.Command("go", "build", "-o", binPath, ".")
+	buildCmd.Dir = filepath.Join(repoRoot(t), "proxy-gateway")
+	buildCmd.Stdout = os.Stderr
+	buildCmd.Stderr = os.Stderr
+	if err := buildCmd.Run(); err != nil {
+		t.Fatalf("build proxy-gateway: %v", err)
+	}
+
+	gwCmd := exec.Command(binPath, cfgFile)
+	// PROXY_MITM_INSECURE_UPSTREAM lets the gateway's httpcloak client trust the
+	// echo server's self-signed certificate without affecting the TLS fingerprint.
+	gwCmd.Env = append(os.Environ(), "PROXY_MITM_INSECURE_UPSTREAM=true")
+	gwCmd.Stdout = os.Stderr
+	gwCmd.Stderr = os.Stderr
+	if err := gwCmd.Start(); err != nil {
+		t.Fatalf("start proxy-gateway: %v", err)
+	}
+	defer gwCmd.Process.Kill() //nolint:errcheck
+
+	waitReady(t, gatewayHTTPAddr, 5*time.Second)
+
+	presets := []string{"chrome-latest", "firefox-latest", "safari-latest"}
+	ja4ByPreset := make(map[string]string, len(presets))
+
+	for _, preset := range presets {
+		t.Run(preset, func(t *testing.T) {
+			// Request through proxy-gateway with this preset.
+			usernameJSON := fmt.Sprintf(`{"set":"direct","httpcloak":%q}`, preset)
+			username := base64.StdEncoding.EncodeToString([]byte(usernameJSON))
+
+			proxyRawURL := "http://" + gatewayHTTPAddr
+			pu, _ := url.Parse(proxyRawURL)
+			pu.User = url.UserPassword(username, "x")
+
+			httpClient := &http.Client{
+				Transport: &http.Transport{
+					Proxy:           http.ProxyURL(pu),
+					TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec
+				},
+				Timeout: 30 * time.Second,
+			}
+
+			resp, err := httpClient.Get(echoURL + "/")
+			if err != nil {
+				t.Fatalf("HTTPS request through gateway: %v", err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusOK {
+				body, _ := io.ReadAll(resp.Body)
+				t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+			}
+
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("reading response body: %v", err)
+			}
+
+			var result fingerprintEchoResponse
+			if err := json.Unmarshal(body, &result); err != nil {
+				t.Fatalf("parsing response %q: %v", body, err)
+			}
+
+			if result.Fingerprint.JA3Hash == "" {
+				t.Fatalf("expected non-empty ja3_hash (full response: %s)", body)
+			}
+			t.Logf("proxied: ja3_hash=%s  ja4=%s  verdict=%s (score=%.2f)",
+				result.Fingerprint.JA3Hash, result.Fingerprint.JA4,
+				result.Verdict.Level, result.Verdict.Score)
+
+			// Derive the expected fingerprint by making a direct httpcloak request
+			// to the same echo server (no proxy-gateway in the path).
+			direct := directFingerprintRequest(t, echoURL, preset)
+			t.Logf("direct:  ja3_hash=%s  ja4=%s", direct.Fingerprint.JA3Hash, direct.Fingerprint.JA4)
+
+			// JA3 includes extension order, which httpcloak randomises (Chrome behaviour).
+			// JA4 is order-independent, so it's the right fingerprint to compare.
+			if result.Fingerprint.JA4 != direct.Fingerprint.JA4 {
+				t.Errorf("JA4 mismatch: proxied=%s direct=%s\nproxied JA3Raw=%s\ndirect  JA3Raw=%s",
+					result.Fingerprint.JA4, direct.Fingerprint.JA4,
+					result.Fingerprint.JA3Raw, direct.Fingerprint.JA3Raw)
+			}
+
+			ja4ByPreset[preset] = result.Fingerprint.JA4
+		})
+	}
+
+	// Verify that different presets produce distinct JA4 values.
+	seen := map[string]string{}
+	for preset, ja4 := range ja4ByPreset {
+		if other, exists := seen[ja4]; exists {
+			t.Errorf("presets %q and %q produced the same JA4 %q", preset, other, ja4)
+		}
+		seen[ja4] = preset
 	}
 }
 
