@@ -32,6 +32,7 @@ package proxykit_test
 
 import (
 	"bufio"
+	"compress/gzip"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -1467,4 +1468,629 @@ func TestE2E_ConcurrentSOCKS5Tunnels(t *testing.T) {
 	for err := range errs {
 		t.Error(err)
 	}
+}
+
+// ── 9. MITM compression handling ────────────────────────────────────────────
+
+// portAwareInterceptor is like StandardInterceptor but dials the correct port
+// instead of hardcoding 443. Needed for tests where the TLS target runs on a
+// random port.
+type portAwareInterceptor struct {
+	port uint16
+}
+
+func (p *portAwareInterceptor) RoundTrip(ctx context.Context, httpReq *http.Request, host string, proxy *proxykit.Proxy) (*http.Response, error) {
+	target := fmt.Sprintf("127.0.0.1:%d", p.port)
+	conn, err := tls.Dial("tcp", target, &tls.Config{InsecureSkipVerify: true})
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	out := httpReq.Clone(ctx)
+	out.URL.Scheme = ""
+	out.URL.Host = ""
+	out.RequestURI = httpReq.URL.RequestURI()
+	if out.RequestURI == "" {
+		out.RequestURI = "/"
+	}
+	if err := out.Write(conn); err != nil {
+		return nil, err
+	}
+	return http.ReadResponse(bufio.NewReader(conn), out)
+}
+
+// gzipTargetServer starts a TLS server that returns gzip-compressed responses
+// with Content-Encoding: gzip. The body is "GZIP-OK: <path>".
+func gzipTargetServer(t *testing.T, ca tls.Certificate) (addr string, port uint16, cleanup func()) {
+	t.Helper()
+	fp, err := proxykit.NewForgedCertProvider(ca)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := fp.CertForHost("127.0.0.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
+		Certificates: []tls.Certificate{*cert},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			body := fmt.Sprintf("GZIP-OK: %s", r.URL.Path)
+			w.Header().Set("Content-Encoding", "gzip")
+			w.Header().Set("Content-Type", "text/plain")
+			gz := gzip.NewWriter(w)
+			gz.Write([]byte(body))
+			gz.Close()
+		}),
+	}
+	go srv.Serve(ln)
+	return ln.Addr().String(), mustPort(t, ln.Addr().String()), func() { srv.Close() }
+}
+
+// TestE2E_MITM_GzipResponse verifies that a gzip response through MITM is
+// received correctly by the client — no double-decompression errors.
+func TestE2E_MITM_GzipResponse(t *testing.T) {
+	ca, err := proxykit.NewCA()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, tlsPort, closeTLS := gzipTargetServer(t, ca)
+	defer closeTLS()
+
+	certs, _ := proxykit.NewForgedCertProvider(ca)
+	inner := staticSource(&proxykit.Proxy{Host: "127.0.0.1", Port: tlsPort})
+	interceptor := &portAwareInterceptor{port: tlsPort}
+	pipeline := proxykit.MITM(certs, interceptor, inner)
+
+	proxyAddr, closeProxy := startHTTPProxy(t, pipeline, directUpstream)
+	defer closeProxy()
+
+	caPool, err := caX509Pool(ca)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxyURL := &url.URL{Scheme: "http", Host: proxyAddr, User: url.UserPassword("", "")}
+	client := &http.Client{
+		Transport: &http.Transport{
+			Proxy:           http.ProxyURL(proxyURL),
+			TLSClientConfig: &tls.Config{RootCAs: caPool},
+		},
+		Timeout: 5 * time.Second,
+	}
+
+	resp, err := client.Get(fmt.Sprintf("https://127.0.0.1:%d/test", tlsPort))
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading body: %v", err)
+	}
+
+	if string(body) != "GZIP-OK: /test" {
+		t.Fatalf("body = %q, want %q", body, "GZIP-OK: /test")
+	}
+}
+
+// TestE2E_MITM_GzipKeepAlive verifies that multiple requests over a single
+// keep-alive connection work when the target returns gzip responses. Catches
+// Content-Length mismatches that corrupt the H1 framing.
+func TestE2E_MITM_GzipKeepAlive(t *testing.T) {
+	ca, err := proxykit.NewCA()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, tlsPort, closeTLS := gzipTargetServer(t, ca)
+	defer closeTLS()
+
+	certs, _ := proxykit.NewForgedCertProvider(ca)
+	inner := staticSource(&proxykit.Proxy{Host: "127.0.0.1", Port: tlsPort})
+	interceptor := &portAwareInterceptor{port: tlsPort}
+	pipeline := proxykit.MITM(certs, interceptor, inner)
+
+	proxyAddr, closeProxy := startHTTPProxy(t, pipeline, directUpstream)
+	defer closeProxy()
+
+	caPool, err := caX509Pool(ca)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxyURL := &url.URL{Scheme: "http", Host: proxyAddr, User: url.UserPassword("", "")}
+	client := &http.Client{
+		Transport: &http.Transport{
+			Proxy:           http.ProxyURL(proxyURL),
+			TLSClientConfig: &tls.Config{RootCAs: caPool},
+		},
+		Timeout: 5 * time.Second,
+	}
+
+	for i := 0; i < 5; i++ {
+		path := fmt.Sprintf("/req%d", i)
+		resp, err := client.Get(fmt.Sprintf("https://127.0.0.1:%d%s", tlsPort, path))
+		if err != nil {
+			t.Fatalf("request %d failed: %v", i, err)
+		}
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			t.Fatalf("request %d: reading body: %v", i, err)
+		}
+		expected := fmt.Sprintf("GZIP-OK: %s", path)
+		if string(body) != expected {
+			t.Fatalf("request %d: body = %q, want %q", i, body, expected)
+		}
+	}
+}
+
+// TestE2E_MITM_UncompressedPassesThrough verifies that responses without
+// Content-Encoding pass through the MITM unchanged.
+func TestE2E_MITM_UncompressedPassesThrough(t *testing.T) {
+	ca, err := proxykit.NewCA()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Use a plain TLS server (no gzip) on 127.0.0.1.
+	fp, _ := proxykit.NewForgedCertProvider(ca)
+	cert, _ := fp.CertForHost("127.0.0.1")
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
+		Certificates: []tls.Certificate{*cert},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprintf(w, "PLAIN-OK: %s", r.URL.Path)
+		}),
+	}
+	go srv.Serve(ln)
+	defer srv.Close()
+	tlsPort := mustPort(t, ln.Addr().String())
+
+	certs, _ := proxykit.NewForgedCertProvider(ca)
+	inner := staticSource(&proxykit.Proxy{Host: "127.0.0.1", Port: tlsPort})
+	interceptor := &portAwareInterceptor{port: tlsPort}
+	pipeline := proxykit.MITM(certs, interceptor, inner)
+
+	proxyAddr, closeProxy := startHTTPProxy(t, pipeline, directUpstream)
+	defer closeProxy()
+
+	caPool, err := caX509Pool(ca)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxyURL := &url.URL{Scheme: "http", Host: proxyAddr, User: url.UserPassword("", "")}
+	client := &http.Client{
+		Transport: &http.Transport{
+			Proxy:           http.ProxyURL(proxyURL),
+			TLSClientConfig: &tls.Config{RootCAs: caPool},
+		},
+		Timeout: 5 * time.Second,
+	}
+
+	resp, err := client.Get(fmt.Sprintf("https://127.0.0.1:%d/hello", tlsPort))
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	if string(body) != "PLAIN-OK: /hello" {
+		t.Fatalf("body = %q, want %q", body, "PLAIN-OK: /hello")
+	}
+}
+
+// TestE2E_MITM_GzipH2 verifies gzip handling over H2 between client and MITM.
+func TestE2E_MITM_GzipH2(t *testing.T) {
+	ca, err := proxykit.NewCA()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, tlsPort, closeTLS := gzipTargetServer(t, ca)
+	defer closeTLS()
+
+	certs, _ := proxykit.NewForgedCertProvider(ca)
+	inner := staticSource(&proxykit.Proxy{Host: "127.0.0.1", Port: tlsPort})
+	interceptor := &portAwareInterceptor{port: tlsPort}
+	pipeline := proxykit.MITM(certs, interceptor, inner)
+
+	proxyAddr, closeProxy := startHTTPProxy(t, pipeline, directUpstream)
+	defer closeProxy()
+
+	caPool, err := caX509Pool(ca)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxyURL := &url.URL{Scheme: "http", Host: proxyAddr, User: url.UserPassword("", "")}
+	client := &http.Client{
+		Transport: &http.Transport{
+			Proxy:             http.ProxyURL(proxyURL),
+			TLSClientConfig:   &tls.Config{RootCAs: caPool},
+			ForceAttemptHTTP2: true,
+		},
+		Timeout: 5 * time.Second,
+	}
+
+	resp, err := client.Get(fmt.Sprintf("https://127.0.0.1:%d/h2test", tlsPort))
+	if err != nil {
+		t.Fatalf("H2 request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading body: %v", err)
+	}
+
+	if string(body) != "GZIP-OK: /h2test" {
+		t.Fatalf("body = %q, want %q", body, "GZIP-OK: /h2test")
+	}
+}
+
+// TestE2E_MITM_HTTPCloakKeepAlive tests multiple sequential requests on the
+// same H1 keep-alive connection using the REAL httpcloak TLS fingerprinting
+// interceptor (not the simplified portAwareInterceptor). This is the exact
+// code path used by the IS24 login flow.
+func TestE2E_MITM_HTTPCloakKeepAlive(t *testing.T) {
+	ca, err := proxykit.NewCA()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// TLS target server with mixed responses
+	fp, _ := proxykit.NewForgedCertProvider(ca)
+	cert, _ := fp.CertForHost("127.0.0.1")
+	ln, _ := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
+		Certificates: []tls.Certificate{*cert},
+	})
+	var reqCount int32
+	srv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			n := atomic.AddInt32(&reqCount, 1)
+			body := fmt.Sprintf("req%d:%s:%s", n, r.Method, r.URL.Path)
+
+			if strings.Contains(r.URL.Path, "gzip") {
+				w.Header().Set("Content-Encoding", "gzip")
+				w.Header().Set("Content-Type", "application/json")
+				gz := gzip.NewWriter(w)
+				gz.Write([]byte(body))
+				gz.Close()
+			} else {
+				w.Header().Set("Content-Type", "text/plain")
+				fmt.Fprint(w, body)
+			}
+		}),
+	}
+	go srv.Serve(ln)
+	defer srv.Close()
+	tlsPort := mustPort(t, ln.Addr().String())
+
+	// Use TLSFingerprintSpoofing — the real httpcloak interceptor.
+	// Empty proxy host = httpcloak connects directly to the target (no upstream proxy).
+	// insecure=true since the test target uses a self-signed cert.
+	inner := staticSource(&proxykit.Proxy{})
+	pipeline := utils.TLSFingerprintSpoofingWithOptions(ca, "chrome-146", true, inner)
+
+	proxyAddr, closeProxy := startHTTPProxy(t, pipeline, directUpstream)
+	defer closeProxy()
+
+	caPool, _ := caX509Pool(ca)
+	proxyURL := &url.URL{Scheme: "http", Host: proxyAddr, User: url.UserPassword("", "")}
+	client := &http.Client{
+		Transport: &http.Transport{
+			Proxy:               http.ProxyURL(proxyURL),
+			TLSClientConfig:     &tls.Config{RootCAs: caPool},
+			MaxIdleConnsPerHost: 1,
+			MaxConnsPerHost:     1,
+		},
+		Timeout: 15 * time.Second,
+	}
+
+	// Simulate IS24 login flow: 8 sequential requests, mix of GET/POST, gzip/plain
+	requests := []struct {
+		method string
+		path   string
+		body   string
+	}{
+		{"POST", "/nonce/gzip", `{"n":"1"}`},
+		{"GET", "/authorize/gzip", ""},
+		{"POST", "/introspect/plain", `{"s":"x"}`},
+		{"POST", "/identify/gzip", `{"u":"test"}`},
+		{"POST", "/challenge/gzip", `{"a":"1"}`},
+		{"POST", "/answer/gzip", `{"p":"test"}`},
+		{"GET", "/redirect/plain", ""},
+		{"POST", "/token/gzip", `{"c":"abc"}`},
+	}
+
+	for i, req := range requests {
+		var bodyReader io.Reader
+		if req.body != "" {
+			bodyReader = strings.NewReader(req.body)
+		}
+		httpReq, _ := http.NewRequest(req.method, fmt.Sprintf("https://127.0.0.1:%d%s", tlsPort, req.path), bodyReader)
+		if req.body != "" {
+			httpReq.Header.Set("Content-Type", "application/json")
+		}
+
+		resp, err := client.Do(httpReq)
+		if err != nil {
+			t.Fatalf("request %d (%s %s) failed: %v", i+1, req.method, req.path, err)
+		}
+		respBody, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			t.Fatalf("request %d: reading body: %v", i+1, err)
+		}
+
+		expected := fmt.Sprintf("req%d:%s:%s", i+1, req.method, req.path)
+		if string(respBody) != expected {
+			t.Fatalf("request %d: body = %q, want %q", i+1, respBody, expected)
+		}
+	}
+	t.Logf("All %d sequential requests succeeded via httpcloak MITM", len(requests))
+}
+
+// TestE2E_MITM_MixedCompressionKeepAlive simulates the IS24 login flow:
+// multiple sequential requests on the SAME H1 keep-alive connection where
+// some responses are gzip-compressed and some are not. This catches
+// Content-Length mismatches, body framing corruption, and connection reuse
+// issues after body close.
+func TestE2E_MITM_MixedCompressionKeepAlive(t *testing.T) {
+	ca, err := proxykit.NewCA()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Target server: some endpoints return gzip, some don't, some return
+	// chunked (no Content-Length), some return POST responses.
+	fp, _ := proxykit.NewForgedCertProvider(ca)
+	cert, _ := fp.CertForHost("127.0.0.1")
+	ln, _ := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
+		Certificates: []tls.Certificate{*cert},
+	})
+	var requestCount int32
+	srv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			n := atomic.AddInt32(&requestCount, 1)
+			path := r.URL.Path
+			body := fmt.Sprintf("req%d:%s:%s", n, r.Method, path)
+
+			switch {
+			case strings.HasSuffix(path, "/gzip"):
+				// Gzip compressed with Content-Length
+				w.Header().Set("Content-Encoding", "gzip")
+				w.Header().Set("Content-Type", "application/json")
+				gz := gzip.NewWriter(w)
+				gz.Write([]byte(body))
+				gz.Close()
+			case strings.HasSuffix(path, "/chunked"):
+				// Chunked (no Content-Length), not compressed
+				flusher, _ := w.(http.Flusher)
+				w.Header().Set("Content-Type", "application/json")
+				fmt.Fprint(w, body)
+				flusher.Flush()
+			case strings.HasSuffix(path, "/gzip-chunked"):
+				// Gzip + chunked (no Content-Length)
+				flusher, _ := w.(http.Flusher)
+				w.Header().Set("Content-Encoding", "gzip")
+				w.Header().Set("Content-Type", "application/json")
+				gz := gzip.NewWriter(w)
+				gz.Write([]byte(body))
+				gz.Close()
+				flusher.Flush()
+			default:
+				// Plain with Content-Length
+				w.Header().Set("Content-Type", "text/plain")
+				fmt.Fprint(w, body)
+			}
+		}),
+	}
+	go srv.Serve(ln)
+	defer srv.Close()
+	tlsPort := mustPort(t, ln.Addr().String())
+
+	certs, _ := proxykit.NewForgedCertProvider(ca)
+	inner := staticSource(&proxykit.Proxy{Host: "127.0.0.1", Port: tlsPort})
+	interceptor := &portAwareInterceptor{port: tlsPort}
+	pipeline := proxykit.MITM(certs, interceptor, inner)
+
+	proxyAddr, closeProxy := startHTTPProxy(t, pipeline, directUpstream)
+	defer closeProxy()
+
+	caPool, _ := caX509Pool(ca)
+	proxyURL := &url.URL{Scheme: "http", Host: proxyAddr, User: url.UserPassword("", "")}
+	client := &http.Client{
+		Transport: &http.Transport{
+			Proxy:           http.ProxyURL(proxyURL),
+			TLSClientConfig: &tls.Config{RootCAs: caPool},
+			// Force single connection (H1 keep-alive)
+			MaxIdleConnsPerHost: 1,
+			MaxConnsPerHost:     1,
+		},
+		Timeout: 10 * time.Second,
+	}
+
+	// Simulate IS24 login flow: mix of GET/POST, gzip/plain/chunked
+	requests := []struct {
+		method string
+		path   string
+		body   string
+	}{
+		{"POST", "/nonce/gzip", `{"nonce":"abc"}`},       // 1: POST, gzip
+		{"GET", "/authorize/gzip", ""},                    // 2: GET, gzip (like authorize URL)
+		{"POST", "/introspect/chunked", `{"state":"x"}`}, // 3: POST, chunked
+		{"POST", "/identify/gzip", `{"user":"test"}`},     // 4: POST, gzip
+		{"POST", "/challenge/gzip", `{"pass":"test"}`},    // 5: POST, gzip
+		{"POST", "/answer/gzip-chunked", `{"otp":"123"}`}, // 6: POST, gzip+chunked
+		{"GET", "/redirect/plain", ""},                     // 7: GET, plain
+		{"POST", "/token/gzip", `{"code":"abc"}`},          // 8: POST, gzip
+	}
+
+	for i, req := range requests {
+		var bodyReader io.Reader
+		if req.body != "" {
+			bodyReader = strings.NewReader(req.body)
+		}
+		httpReq, _ := http.NewRequest(req.method, fmt.Sprintf("https://127.0.0.1:%d%s", tlsPort, req.path), bodyReader)
+		if req.body != "" {
+			httpReq.Header.Set("Content-Type", "application/json")
+		}
+
+		resp, err := client.Do(httpReq)
+		if err != nil {
+			t.Fatalf("request %d (%s %s) failed: %v", i+1, req.method, req.path, err)
+		}
+		respBody, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			t.Fatalf("request %d: reading body: %v", i+1, err)
+		}
+
+		// Body should start with "req<n>:"
+		expected := fmt.Sprintf("req%d:%s:%s", i+1, req.method, req.path)
+		if string(respBody) != expected {
+			t.Fatalf("request %d: body = %q, want %q", i+1, respBody, expected)
+		}
+	}
+	t.Logf("All %d sequential requests succeeded on same H1 keep-alive connection", len(requests))
+}
+
+// TestE2E_MITM_HTTPCloakKeepAliveWithUpstreamProxy tests session reuse through
+// an actual upstream HTTP CONNECT proxy — this is the exact architecture used
+// by the IS24 login flow (Bun → proxy-gateway MITM → upstream proxy → target).
+// The upstream proxy is a simple CONNECT proxy running locally.
+func TestE2E_MITM_HTTPCloakKeepAliveWithUpstreamProxy(t *testing.T) {
+	ca, err := proxykit.NewCA()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. TLS target server with mixed responses
+	fp, _ := proxykit.NewForgedCertProvider(ca)
+	cert, _ := fp.CertForHost("127.0.0.1")
+	targetLn, _ := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
+		Certificates: []tls.Certificate{*cert},
+	})
+	var reqCount int32
+	targetSrv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			n := atomic.AddInt32(&reqCount, 1)
+			body := fmt.Sprintf("req%d:%s:%s", n, r.Method, r.URL.Path)
+			if strings.Contains(r.URL.Path, "gzip") {
+				w.Header().Set("Content-Encoding", "gzip")
+				w.Header().Set("Content-Type", "application/json")
+				gz := gzip.NewWriter(w)
+				gz.Write([]byte(body))
+				gz.Close()
+			} else {
+				w.Header().Set("Content-Type", "text/plain")
+				fmt.Fprint(w, body)
+			}
+		}),
+	}
+	go targetSrv.Serve(targetLn)
+	defer targetSrv.Close()
+	targetPort := mustPort(t, targetLn.Addr().String())
+
+	// 2. Upstream CONNECT proxy (simulates proxying.io)
+	upstreamLn, _ := net.Listen("tcp", "127.0.0.1:0")
+	upstreamPort := mustPort(t, upstreamLn.Addr().String())
+	go func() {
+		for {
+			conn, err := upstreamLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				br := bufio.NewReader(c)
+				req, err := http.ReadRequest(br)
+				if err != nil || req.Method != "CONNECT" {
+					return
+				}
+				target, err := net.Dial("tcp", req.Host)
+				if err != nil {
+					fmt.Fprintf(c, "HTTP/1.1 502 Bad Gateway\r\n\r\n")
+					return
+				}
+				defer target.Close()
+				fmt.Fprintf(c, "HTTP/1.1 200 Connection Established\r\n\r\n")
+				done := make(chan struct{}, 2)
+				go func() { io.Copy(target, br); done <- struct{}{} }()
+				go func() { io.Copy(c, target); done <- struct{}{} }()
+				<-done
+			}(conn)
+		}
+	}()
+	defer upstreamLn.Close()
+
+	// 3. Proxy-gateway with httpcloak MITM, routing through upstream proxy
+	inner := staticSource(&proxykit.Proxy{Host: "127.0.0.1", Port: upstreamPort})
+	pipeline := utils.TLSFingerprintSpoofingWithOptions(ca, "chrome-146", true, inner)
+
+	proxyAddr, closeProxy := startHTTPProxy(t, pipeline, proxykit.HTTPUpstream{})
+	defer closeProxy()
+
+	caPool, _ := caX509Pool(ca)
+	proxyURL := &url.URL{Scheme: "http", Host: proxyAddr, User: url.UserPassword("", "")}
+	client := &http.Client{
+		Transport: &http.Transport{
+			Proxy:               http.ProxyURL(proxyURL),
+			TLSClientConfig:     &tls.Config{RootCAs: caPool},
+			MaxIdleConnsPerHost: 1,
+			MaxConnsPerHost:     1,
+		},
+		Timeout: 15 * time.Second,
+	}
+
+	requests := []struct {
+		method string
+		path   string
+		body   string
+	}{
+		{"POST", "/nonce/gzip", `{"n":"1"}`},
+		{"GET", "/authorize/gzip", ""},
+		{"POST", "/introspect/plain", `{"s":"x"}`},
+		{"POST", "/identify/gzip", `{"u":"test"}`},
+		{"POST", "/challenge/gzip", `{"a":"1"}`},
+		{"POST", "/answer/gzip", `{"p":"test"}`},
+		{"GET", "/redirect/plain", ""},
+		{"POST", "/token/gzip", `{"c":"abc"}`},
+	}
+
+	for i, req := range requests {
+		var bodyReader io.Reader
+		if req.body != "" {
+			bodyReader = strings.NewReader(req.body)
+		}
+		httpReq, _ := http.NewRequest(req.method, fmt.Sprintf("https://127.0.0.1:%d%s", targetPort, req.path), bodyReader)
+		if req.body != "" {
+			httpReq.Header.Set("Content-Type", "application/json")
+		}
+
+		resp, err := client.Do(httpReq)
+		if err != nil {
+			t.Fatalf("request %d (%s %s) failed: %v", i+1, req.method, req.path, err)
+		}
+		respBody, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			t.Fatalf("request %d: reading body: %v", i+1, err)
+		}
+
+		expected := fmt.Sprintf("req%d:%s:%s", i+1, req.method, req.path)
+		if string(respBody) != expected {
+			t.Fatalf("request %d: body = %q, want %q", i+1, respBody, expected)
+		}
+	}
+	t.Logf("All %d requests succeeded via httpcloak MITM with upstream proxy", len(requests))
 }

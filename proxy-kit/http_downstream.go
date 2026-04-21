@@ -154,10 +154,19 @@ func (d *HTTPDownstream) serveConnect(w http.ResponseWriter, r *http.Request, ra
 	// NeedsConn: middleware (e.g. MITM) requires the raw client connection
 	// before it can resolve. Hijack first, send 200, then re-resolve with conn.
 	if result != nil && result.NeedsConn {
-		w.WriteHeader(http.StatusOK)
 		rawConn, bufrw, err := hj.Hijack()
 		if err != nil {
 			slog.Error("hijack failed", "err", err)
+			return
+		}
+		// Write the CONNECT 200 on the raw connection — same as the non-MITM
+		// path below. Using w.WriteHeader() would cause net/http to append
+		// Transfer-Encoding/Date headers that break clients (e.g. Bun) which
+		// interpret them as body framing on the tunnel.
+		_ = bufrw.Flush()
+		if _, err := rawConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
+			slog.Error("write 200 failed (NeedsConn)", "err", err)
+			rawConn.Close()
 			return
 		}
 		clientConn := newClientConn(rawConn, bufrw)

@@ -14,3 +14,6 @@ proxy-gateway/proxy-gateway
 # IDE / OS
 .DS_Store
 .pi/
+
+# Local httpcloak patch (vendored, not public)
+httpcloak-patched/

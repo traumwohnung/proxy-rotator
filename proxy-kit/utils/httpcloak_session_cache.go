@@ -9,10 +9,12 @@ import (
 )
 
 const (
-	// Sessions unused for this long are evicted.
-	httpcloakSessionIdleTimeout = 5 * time.Minute
+	// Sessions unused for this long are evicted. Kept low to avoid holding
+	// stale connections — upstream proxies (proxying.io) close idle CONNECT
+	// tunnels after ~30-60s.
+	httpcloakSessionIdleTimeout = 90 * time.Second
 	// How often the cleanup goroutine runs.
-	httpcloakSessionCleanupInterval = 60 * time.Second
+	httpcloakSessionCleanupInterval = 30 * time.Second
 )
 
 type httpcloakCacheEntry struct {

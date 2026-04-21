@@ -39,3 +39,5 @@ require (
 )
 
 replace proxy-kit => ../proxy-kit
+
+replace github.com/sardanioss/httpcloak => ../httpcloak-patched

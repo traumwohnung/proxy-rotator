@@ -2,8 +2,9 @@ FROM golang:1.26-alpine AS builder
 
 WORKDIR /build
 
-# Copy both modules (proxy-gateway depends on proxy-kit via replace directive)
+# Copy all modules (proxy-gateway depends on proxy-kit, proxy-kit depends on httpcloak-patched via replace)
 COPY proxy-kit/ ./proxy-kit/
+COPY httpcloak-patched/ ./httpcloak-patched/
 COPY proxy-gateway/go.mod proxy-gateway/go.sum ./proxy-gateway/
 
 WORKDIR /build/proxy-gateway

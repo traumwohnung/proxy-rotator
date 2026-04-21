@@ -1,12 +1,14 @@
 package utils
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -239,13 +241,18 @@ func userAgentMatchesPreset(clientUA, presetUA string) bool {
 //
 // Preset examples: "chrome-latest", "firefox-latest", "safari-latest"
 func TLSFingerprintSpoofing(ca tls.Certificate, preset string, inner proxykit.Handler) proxykit.Handler {
+	return TLSFingerprintSpoofingWithOptions(ca, preset, false, inner)
+}
+
+func TLSFingerprintSpoofingWithOptions(ca tls.Certificate, preset string, insecure bool, inner proxykit.Handler) proxykit.Handler {
 	certs, err := proxykit.NewForgedCertProvider(ca)
 	if err != nil {
 		panic(fmt.Sprintf("tls_fingerprint_spoofing: %v", err))
 	}
 	return proxykit.MITM(certs, &tlsFingerprintInterceptor{
-		spec:  &HTTPCloakSpec{Preset: preset},
-		cache: newHTTPCloakSessionCache(),
+		spec:     &HTTPCloakSpec{Preset: preset},
+		insecure: insecure,
+		cache:    newHTTPCloakSessionCache(),
 	}, inner)
 }
 
@@ -264,21 +271,66 @@ type tlsFingerprintInterceptor struct {
 func (f *tlsFingerprintInterceptor) RoundTrip(ctx context.Context, httpReq *http.Request, host string, proxy *proxykit.Proxy) (*http.Response, error) {
 	proxyURL := proxyToURL(proxy)
 
-	// Try to reuse a cached session for this topLevelSeed.
 	var session *httpcloak.Session
 	var ownsSession bool
 	if f.cache != nil {
 		session = f.cache.getOrCreate(ctx, f.spec, proxyURL, f.insecure)
 	}
 	if session == nil {
-		// No affinity or no cache — create a per-request session.
 		opts := f.spec.sessionOptions(proxyURL, f.insecure)
 		session = httpcloak.NewSession(f.spec.Preset, opts...)
 		ownsSession = true
 	}
 
-	// Prefer httpReq.Host for the target URL: it preserves non-standard ports
-	// (e.g. localhost:8443) that the MITM's targetHost() would strip.
+	// Buffer request body so it can be replayed on retry (the original
+	// httpReq.Body is a one-shot reader from the MITM H1 connection).
+	var reqBodyBytes []byte
+	if httpReq.Body != nil && httpReq.Method != http.MethodGet && httpReq.Method != http.MethodHead {
+		var readErr error
+		reqBodyBytes, readErr = io.ReadAll(httpReq.Body)
+		httpReq.Body.Close()
+		if readErr != nil {
+			return nil, fmt.Errorf("reading request body: %w", readErr)
+		}
+		httpReq.Body = io.NopCloser(bytes.NewReader(reqBodyBytes))
+	}
+
+	resp, err := f.doRoundTrip(ctx, session, httpReq, host, proxyURL)
+
+	// Retry once on stale connection errors — the upstream proxy (e.g.
+	// proxying.io) may have closed the CONNECT tunnel during idle. Evict
+	// the cached session and retry with a fresh one.
+	if err != nil && !ownsSession && isStaleConnectionError(err) {
+		slog.Debug("httpcloak stale session, retrying with fresh",
+			"host", host, "err", err)
+		seed := GetTopLevelSeed(ctx)
+		if seed != 0 && f.cache != nil {
+			f.cache.evict(seed)
+		}
+		session.Close()
+		opts := f.spec.sessionOptions(proxyURL, f.insecure)
+		session = httpcloak.NewSession(f.spec.Preset, opts...)
+		ownsSession = true
+		// Reset request body for replay
+		if reqBodyBytes != nil {
+			httpReq.Body = io.NopCloser(bytes.NewReader(reqBodyBytes))
+		}
+		resp, err = f.doRoundTrip(ctx, session, httpReq, host, proxyURL)
+	}
+
+	if err != nil {
+		if ownsSession {
+			session.Close()
+		}
+		return nil, err
+	}
+	if ownsSession {
+		session.Close()
+	}
+	return resp, nil
+}
+
+func (f *tlsFingerprintInterceptor) doRoundTrip(ctx context.Context, session *httpcloak.Session, httpReq *http.Request, host, proxyURL string) (*http.Response, error) {
 	urlHost := httpReq.Host
 	if urlHost == "" {
 		urlHost = host
@@ -294,11 +346,7 @@ func (f *tlsFingerprintInterceptor) RoundTrip(ctx context.Context, httpReq *http
 		headers[k] = vs
 	}
 
-	// Apply user_agent policy.
 	if err := f.spec.applyUserAgentPolicy(headers); err != nil {
-		if ownsSession {
-			session.Close()
-		}
 		return nil, err
 	}
 
@@ -313,16 +361,12 @@ func (f *tlsFingerprintInterceptor) RoundTrip(ctx context.Context, httpReq *http
 
 	resp, err := session.Do(ctx, cloakReq)
 	if err != nil {
-		if ownsSession {
-			session.Close()
-		}
 		return nil, fmt.Errorf("httpcloak %s: %w", targetURL, err)
 	}
 
-	var body io.ReadCloser = resp.Body
-	if ownsSession {
-		// Per-request session: close it when the body is consumed.
-		body = &sessionClosingBody{ReadCloser: resp.Body, session: session}
+	data, err := resp.Bytes()
+	if err != nil {
+		return nil, fmt.Errorf("reading httpcloak body for %s: %w", targetURL, err)
 	}
 
 	httpResp := &http.Response{
@@ -332,38 +376,37 @@ func (f *tlsFingerprintInterceptor) RoundTrip(ctx context.Context, httpReq *http
 		ProtoMajor:    1,
 		ProtoMinor:    1,
 		Header:        make(http.Header),
-		Body:          body,
-		ContentLength: -1,
+		Body:          io.NopCloser(bytes.NewReader(data)),
+		ContentLength: int64(len(data)),
 	}
 	for k, vs := range resp.Headers {
 		for _, v := range vs {
 			httpResp.Header.Add(k, v)
 		}
 	}
-	// Preserve upstream Content-Length when present so the MITM loop can
-	// keep the client connection alive across HTTP/1.1 keep-alive requests.
-	if cl := httpResp.Header.Get("Content-Length"); cl != "" {
-		fmt.Sscanf(cl, "%d", &httpResp.ContentLength)
-	}
-	// Remove Transfer-Encoding — Go's resp.Write will set it based on ContentLength.
+	httpResp.Header.Del("Content-Encoding")
+	httpResp.Header.Del("Content-Length")
 	httpResp.Header.Del("Transfer-Encoding")
 	return httpResp, nil
 }
 
-// sessionClosingBody wraps the httpcloak response body and closes the
-// httpcloak session when the body is closed. This ties the session lifetime
-// to the body consumption, enabling streaming without buffering.
-type sessionClosingBody struct {
-	io.ReadCloser
-	session *httpcloak.Session
+// isStaleConnectionError detects errors from stale/closed upstream connections.
+func isStaleConnectionError(err error) bool {
+	s := err.Error()
+	return strings.Contains(s, "EOF") ||
+		strings.Contains(s, "connection reset") ||
+		strings.Contains(s, "broken pipe") ||
+		strings.Contains(s, "closed") ||
+		strings.Contains(s, "use of closed network connection") ||
+		strings.Contains(s, "CONNECT failed") ||
+		strings.Contains(s, "dial_proxy")
 }
 
-func (b *sessionClosingBody) Close() error {
-	err := b.ReadCloser.Close()
-	b.session.Close()
-	return err
-}
-
+// closeHTTPCloakBody closes just the underlying HTTP response body of an
+// httpcloak StreamResponse, without canceling the session context. This frees
+// the H2 stream / H1 connection for reuse while keeping the session alive.
+//
+// httpcloak's StreamResponse.Close() always calls cancel() which poisons the
 // DialTLS implements proxykit.WebSocketDialer. It dials the target with a
 // browser-like TLS fingerprint using utls, optionally through an upstream proxy.
 // target is "host:port".

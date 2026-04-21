@@ -285,7 +285,19 @@ func (m *mitmHandler) serveH1(ctx context.Context, tlsConn *tls.Conn, outerReq *
 		}
 
 		resp := m.roundTripMITM(ctx, httpReq, outerReq, host)
+
+		// Drain any unread request body before writing the response.
+		// If the interceptor didn't fully consume httpReq.Body, leftover
+		// bytes would corrupt the next request on this keep-alive connection.
+		if httpReq.Body != nil {
+			io.Copy(io.Discard, httpReq.Body)
+			httpReq.Body.Close()
+		}
+
 		resp.Write(tlsConn)
+
+		// Drain any unread response body (defense-in-depth for partial writes)
+		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 	}
 }
@@ -403,6 +415,7 @@ func (m *mitmHandler) roundTripMITM(ctx context.Context, httpReq *http.Request, 
 
 	resp, fwdErr := m.interceptor.RoundTrip(ctx, httpReq, host, result.Proxy)
 	if fwdErr != nil {
+		slog.Warn("MITM roundtrip failed", "host", host, "method", httpReq.Method, "path", httpReq.URL.RequestURI(), "err", fwdErr)
 		return errorResponse(http.StatusBadGateway, fwdErr.Error())
 	}
 
