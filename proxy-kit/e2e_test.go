@@ -1739,7 +1739,7 @@ func TestE2E_MITM_GzipH2(t *testing.T) {
 // TestE2E_MITM_HTTPCloakKeepAlive tests multiple sequential requests on the
 // same H1 keep-alive connection using the REAL httpcloak TLS fingerprinting
 // interceptor (not the simplified portAwareInterceptor). This is the exact
-// code path used by the IS24 login flow.
+// code path exercised by a stateful multi-step auth flow through MITM.
 func TestE2E_MITM_HTTPCloakKeepAlive(t *testing.T) {
 	ca, err := proxykit.NewCA()
 	if err != nil {
@@ -1795,7 +1795,7 @@ func TestE2E_MITM_HTTPCloakKeepAlive(t *testing.T) {
 		Timeout: 15 * time.Second,
 	}
 
-	// Simulate IS24 login flow: 8 sequential requests, mix of GET/POST, gzip/plain
+	// Simulate a multi-step auth flow: 8 sequential requests, mix of GET/POST, gzip/plain
 	requests := []struct {
 		method string
 		path   string
@@ -1839,8 +1839,8 @@ func TestE2E_MITM_HTTPCloakKeepAlive(t *testing.T) {
 	t.Logf("All %d sequential requests succeeded via httpcloak MITM", len(requests))
 }
 
-// TestE2E_MITM_MixedCompressionKeepAlive simulates the IS24 login flow:
-// multiple sequential requests on the SAME H1 keep-alive connection where
+// TestE2E_MITM_MixedCompressionKeepAlive simulates a multi-step stateful
+// flow: multiple sequential requests on the SAME H1 keep-alive connection where
 // some responses are gzip-compressed and some are not. This catches
 // Content-Length mismatches, body framing corruption, and connection reuse
 // issues after body close.
@@ -1919,7 +1919,7 @@ func TestE2E_MITM_MixedCompressionKeepAlive(t *testing.T) {
 		Timeout: 10 * time.Second,
 	}
 
-	// Simulate IS24 login flow: mix of GET/POST, gzip/plain/chunked
+	// Simulate a multi-step auth flow: mix of GET/POST, gzip/plain/chunked
 	requests := []struct {
 		method string
 		path   string
@@ -1965,8 +1965,9 @@ func TestE2E_MITM_MixedCompressionKeepAlive(t *testing.T) {
 }
 
 // TestE2E_MITM_HTTPCloakKeepAliveWithUpstreamProxy tests session reuse through
-// an actual upstream HTTP CONNECT proxy — this is the exact architecture used
-// by the IS24 login flow (Bun → proxy-gateway MITM → upstream proxy → target).
+// an actual upstream HTTP CONNECT proxy — the architecture used when a
+// client speaks to the MITM and the MITM chains through a residential proxy
+// to reach the target (client → proxy-gateway MITM → upstream proxy → target).
 // The upstream proxy is a simple CONNECT proxy running locally.
 func TestE2E_MITM_HTTPCloakKeepAliveWithUpstreamProxy(t *testing.T) {
 	ca, err := proxykit.NewCA()
@@ -2001,7 +2002,7 @@ func TestE2E_MITM_HTTPCloakKeepAliveWithUpstreamProxy(t *testing.T) {
 	defer targetSrv.Close()
 	targetPort := mustPort(t, targetLn.Addr().String())
 
-	// 2. Upstream CONNECT proxy (simulates proxying.io)
+	// 2. Upstream CONNECT proxy (simulates a residential HTTP proxy)
 	upstreamLn, _ := net.Listen("tcp", "127.0.0.1:0")
 	upstreamPort := mustPort(t, upstreamLn.Addr().String())
 	go func() {

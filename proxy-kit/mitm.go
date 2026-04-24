@@ -213,6 +213,71 @@ type mitmHandler struct {
 	interceptor Interceptor
 }
 
+// TunnelScope is a per-client-tunnel value bag that interceptors can use to
+// scope state (e.g. upstream HTTP sessions) to one MITM tunnel's lifetime.
+// mitmHandler.Resolve populates this in ctx before serveH1/serveH2 and calls
+// cleanup on every registered closer when the tunnel ends.
+//
+// This prevents state bleed across tunnels. The old pattern of caching state
+// by affinity seed across tunnels caused cookies, cached TLS sessions, and
+// connection pools from one flow to silently contaminate the next flow —
+// for example, a successful authentication leaving session cookies that
+// make the target server short-circuit the next login attempt past the
+// login form because the user appears already authenticated.
+type TunnelScope struct {
+	mu       sync.Mutex
+	values   map[any]any
+	cleanups []func()
+}
+
+// GetOrSet returns an existing value for the key, or creates one via factory
+// and stores it. factory returns (value, cleanup). cleanup (if non-nil) runs
+// when the tunnel ends.
+func (ts *TunnelScope) GetOrSet(key any, factory func() (any, func())) any {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	if ts.values == nil {
+		ts.values = make(map[any]any)
+	}
+	if v, ok := ts.values[key]; ok {
+		return v
+	}
+	v, cleanup := factory()
+	ts.values[key] = v
+	if cleanup != nil {
+		ts.cleanups = append(ts.cleanups, cleanup)
+	}
+	return v
+}
+
+// close runs all registered cleanups in reverse order (LIFO). Idempotent.
+func (ts *TunnelScope) close() {
+	ts.mu.Lock()
+	cleanups := ts.cleanups
+	ts.cleanups = nil
+	ts.values = nil
+	ts.mu.Unlock()
+	for i := len(cleanups) - 1; i >= 0; i-- {
+		cleanups[i]()
+	}
+}
+
+type tunnelScopeKey struct{}
+
+// WithTunnelScope returns a child context carrying a fresh TunnelScope and a
+// close function that must be deferred by the caller.
+func WithTunnelScope(ctx context.Context) (context.Context, func()) {
+	ts := &TunnelScope{}
+	return context.WithValue(ctx, tunnelScopeKey{}, ts), ts.close
+}
+
+// GetTunnelScope returns the TunnelScope from ctx, or nil if the caller isn't
+// inside a tunnel (e.g. direct call path, SOCKS5 without MITM).
+func GetTunnelScope(ctx context.Context) *TunnelScope {
+	ts, _ := ctx.Value(tunnelScopeKey{}).(*TunnelScope)
+	return ts
+}
+
 func (m *mitmHandler) Resolve(ctx context.Context, req *Request) (*Result, error) {
 	// Don't intercept plain HTTP (HTTPRequest is set) or already-broken TLS.
 	if req.HTTPRequest != nil {
@@ -260,10 +325,17 @@ func (m *mitmHandler) Resolve(ctx context.Context, req *Request) (*Result, error
 		ServerName: host,
 	})
 
+	// Scope interceptor state (upstream httpcloak sessions, cookie jars, etc.)
+	// to this client tunnel's lifetime. When the tunnel ends, every cleanup
+	// registered via TunnelScope.GetOrSet runs — preventing cookie/pool bleed
+	// into the next tunnel that happens to share an affinity seed.
+	tunnelCtx, closeScope := WithTunnelScope(childCtx)
+	defer closeScope()
+
 	if negotiated == "h2" {
-		m.serveH2(childCtx, tlsConn, req, host)
+		m.serveH2(tunnelCtx, tlsConn, req, host)
 	} else {
-		m.serveH1(childCtx, tlsConn, req, host)
+		m.serveH1(tunnelCtx, tlsConn, req, host)
 	}
 
 	tlsConn.Close()
@@ -273,13 +345,31 @@ func (m *mitmHandler) Resolve(ctx context.Context, req *Request) (*Result, error
 // serveH1 handles HTTP/1.1 requests on the MITM'd TLS connection.
 func (m *mitmHandler) serveH1(ctx context.Context, tlsConn *tls.Conn, outerReq *Request, host string) {
 	br := bufio.NewReader(tlsConn)
+	requestNum := 0
+	tunnelStart := time.Now()
 	for {
 		httpReq, err := http.ReadRequest(br)
 		if err != nil {
+			slog.Debug("MITM H1 tunnel closed",
+				"host", host,
+				"requests_served", requestNum,
+				"tunnel_elapsed_ms", time.Since(tunnelStart).Milliseconds(),
+				"read_err", err)
 			break
 		}
+		requestNum++
+		reqStart := time.Now()
+
+		slog.Debug("MITM H1 request read",
+			"host", host,
+			"req_num", requestNum,
+			"method", httpReq.Method,
+			"path", httpReq.URL.RequestURI(),
+			"content_length", httpReq.ContentLength,
+			"transfer_encoding", httpReq.TransferEncoding)
 
 		if isWebSocketUpgrade(httpReq) {
+			slog.Debug("MITM H1 websocket upgrade", "host", host, "req_num", requestNum)
 			m.handleWebSocketUpgrade(ctx, tlsConn, br, httpReq, outerReq, host)
 			return // WebSocket takes over the connection
 		}
@@ -290,15 +380,32 @@ func (m *mitmHandler) serveH1(ctx context.Context, tlsConn *tls.Conn, outerReq *
 		// If the interceptor didn't fully consume httpReq.Body, leftover
 		// bytes would corrupt the next request on this keep-alive connection.
 		if httpReq.Body != nil {
-			io.Copy(io.Discard, httpReq.Body)
+			drained, _ := io.Copy(io.Discard, httpReq.Body)
+			if drained > 0 {
+				slog.Debug("MITM drained unread request body",
+					"host", host, "req_num", requestNum, "bytes", drained)
+			}
 			httpReq.Body.Close()
 		}
 
-		resp.Write(tlsConn)
+		writeStart := time.Now()
+		writeErr := resp.Write(tlsConn)
+		writeElapsed := time.Since(writeStart)
 
 		// Drain any unread response body (defense-in-depth for partial writes)
 		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
+
+		slog.Debug("MITM H1 request complete",
+			"host", host,
+			"req_num", requestNum,
+			"method", httpReq.Method,
+			"path", httpReq.URL.RequestURI(),
+			"resp_status", resp.StatusCode,
+			"resp_content_length", resp.ContentLength,
+			"total_ms", time.Since(reqStart).Milliseconds(),
+			"write_ms", writeElapsed.Milliseconds(),
+			"write_err", writeErr)
 	}
 }
 

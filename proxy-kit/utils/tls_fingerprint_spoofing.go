@@ -146,6 +146,20 @@ func (s *HTTPCloakSpec) IsZero() bool {
 func (s *HTTPCloakSpec) sessionOptions(proxyURL string, insecure bool) []httpcloak.SessionOption {
 	opts := []httpcloak.SessionOption{
 		httpcloak.WithSessionTimeout(30 * time.Second),
+		// Return redirect responses as-is to the MITM caller. Following
+		// redirects inside the proxy is wrong for two reasons:
+		//   1. Apps commonly redirect to non-HTTP schemes for deep links
+		//      (custom URL schemes like "appscheme:/callback?code=..." for
+		//      mobile deep-linking). httpcloak's URL parser mangles those
+		//      into ":80" CONNECT targets that the upstream residential
+		//      proxy correctly rejects as 500s.
+		//   2. The caller (browser, mobile app, scraper) has its own redirect
+		//      policy. Silently following in the proxy bypasses it and can
+		//      leak cookies, expose intermediate URLs, or consume auth codes
+		//      the caller wanted to inspect.
+		// Go's http.Client uses `http.ErrUseLastResponse` for the same
+		// purpose.
+		httpcloak.WithoutRedirects(),
 	}
 	if proxyURL != "" {
 		opts = append(opts, httpcloak.WithSessionProxy(proxyURL))
@@ -268,13 +282,63 @@ type tlsFingerprintInterceptor struct {
 	cache    *httpcloakSessionCache
 }
 
+// RoundTrip forwards a single decrypted request through the httpcloak session.
+//
+// There is deliberately no silent retry here. Any error — pooled tunnel
+// closed by upstream, CONNECT rejected, dial failure — is surfaced to the
+// caller as-is. Transparently reconnecting would open a fresh CONNECT to the
+// residential proxy, which performs a new sticky-session lookup and may land
+// on a different exit IP. For flows whose state is IP-bound (auth tokens,
+// cookie-bound CSRF, OAuth state), a "successful" reconnect is worse than
+// a hard failure because it silently invalidates downstream state.
+//
+// Request body handling: the MITM's http.ReadRequest hands us a *http.body
+// whose lifetime is entangled with the keep-alive loop's bufio.Reader. At
+// least one path through that machinery closes the body before httpcloak's
+// writer finishes reading it, producing
+// "http: invalid Read on closed Body" mid-request. We dodge the whole class
+// by fully buffering the request body here and handing httpcloak a
+// self-contained *bytes.Reader — which also lets httpcloak type-detect
+// Content-Length (http.NewRequestWithContext has a switch on *bytes.Reader)
+// instead of falling back to chunked transfer-encoding, which some upstream
+// APIs reject as malformed.
+// tunnelSessionKey uniquely identifies a session within a tunnel scope. Two
+// requests on the same tunnel with the same preset + upstream proxy share the
+// session; a different preset or different upstream proxy gets a separate
+// session within the same tunnel.
+type tunnelSessionKey struct {
+	preset   string
+	proxyURL string
+	insecure bool
+}
+
 func (f *tlsFingerprintInterceptor) RoundTrip(ctx context.Context, httpReq *http.Request, host string, proxy *proxykit.Proxy) (*http.Response, error) {
 	proxyURL := proxyToURL(proxy)
+	start := time.Now()
+	seed := GetTopLevelSeed(ctx)
 
+	// Prefer a tunnel-scoped session when available (normal MITM path). The
+	// session lives exactly as long as the client TLS tunnel, so cookies and
+	// connection pools cannot leak into a subsequent tunnel that shares the
+	// same affinity seed. Falls back to the old seed-keyed cross-tunnel cache
+	// only when called outside a TunnelScope (tests, direct use).
 	var session *httpcloak.Session
 	var ownsSession bool
-	if f.cache != nil {
+	sessionSource := "fresh"
+	if scope := proxykit.GetTunnelScope(ctx); scope != nil {
+		key := tunnelSessionKey{preset: f.spec.Preset, proxyURL: proxyURL, insecure: f.insecure}
+		v := scope.GetOrSet(key, func() (any, func()) {
+			opts := f.spec.sessionOptions(proxyURL, f.insecure)
+			s := httpcloak.NewSession(f.spec.Preset, opts...)
+			return s, s.Close
+		})
+		session = v.(*httpcloak.Session)
+		sessionSource = "tunnel-scoped"
+	} else if f.cache != nil {
 		session = f.cache.getOrCreate(ctx, f.spec, proxyURL, f.insecure)
+		if session != nil {
+			sessionSource = "cached"
+		}
 	}
 	if session == nil {
 		opts := f.spec.sessionOptions(proxyURL, f.insecure)
@@ -282,55 +346,145 @@ func (f *tlsFingerprintInterceptor) RoundTrip(ctx context.Context, httpReq *http
 		ownsSession = true
 	}
 
-	// Buffer request body so it can be replayed on retry (the original
-	// httpReq.Body is a one-shot reader from the MITM H1 connection).
-	var reqBodyBytes []byte
+	// Cookie-transparency: forward only the cookies the client sent; do not
+	// let httpcloak inject state it accumulated from previous requests.
+	//
+	// httpcloak's Session is designed as an HTTP client with its own cookie
+	// jar. When a session is reused across flows (for TLS connection reuse,
+	// sticky-session affinity, etc.) the jar persists session/SSO cookies
+	// set by a successful authentication — and on the next flow, injects
+	// those into subsequent auth endpoints, making the target server
+	// short-circuit past the login form because the user appears already
+	// authenticated. Downstream clients then get a response they don't
+	// expect.
+	//
+	// Clearing before each request makes the jar a no-op on the outbound
+	// path. The inbound path still copies every Set-Cookie response header
+	// back to the MITM client, so the real cookie state lives with the
+	// client — which is the correct place for it in a forwarding proxy.
+	session.ClearCookies()
+
+	slog.Debug("mitm.request.begin",
+		"host", host,
+		"method", httpReq.Method,
+		"path", httpReq.URL.RequestURI(),
+		"seed", seed,
+		"session", sessionSource,
+		"upstream_proxy", redactProxyURL(proxyURL),
+		"preset", f.spec.Preset)
+
+	// Buffer the request body. See function docstring for why.
+	var reqBody io.Reader
+	var bodyLen int
 	if httpReq.Body != nil && httpReq.Method != http.MethodGet && httpReq.Method != http.MethodHead {
-		var readErr error
-		reqBodyBytes, readErr = io.ReadAll(httpReq.Body)
+		bodyBytes, readErr := io.ReadAll(httpReq.Body)
 		httpReq.Body.Close()
 		if readErr != nil {
-			return nil, fmt.Errorf("reading request body: %w", readErr)
+			slog.Warn("MITM request body buffering failed",
+				"host", host, "method", httpReq.Method, "path", httpReq.URL.RequestURI(),
+				"err", readErr)
+			if ownsSession {
+				session.Close()
+			}
+			return nil, fmt.Errorf("buffering request body: %w", readErr)
 		}
-		httpReq.Body = io.NopCloser(bytes.NewReader(reqBodyBytes))
+		bodyLen = len(bodyBytes)
+		if bodyLen > 0 {
+			// Pass *bytes.Reader untyped so httpcloak's
+			// http.NewRequestWithContext can type-assert for ContentLength.
+			reqBody = bytes.NewReader(bodyBytes)
+		}
 	}
 
-	resp, err := f.doRoundTrip(ctx, session, httpReq, host, proxyURL)
+	resp, err := f.doRoundTrip(ctx, session, httpReq, reqBody, host, proxyURL)
+	elapsed := time.Since(start)
 
-	// Retry once on stale connection errors — the upstream proxy (e.g.
-	// proxying.io) may have closed the CONNECT tunnel during idle. Evict
-	// the cached session and retry with a fresh one.
-	if err != nil && !ownsSession && isStaleConnectionError(err) {
-		slog.Debug("httpcloak stale session, retrying with fresh",
-			"host", host, "err", err)
-		seed := GetTopLevelSeed(ctx)
-		if seed != 0 && f.cache != nil {
-			f.cache.evict(seed)
-		}
-		session.Close()
-		opts := f.spec.sessionOptions(proxyURL, f.insecure)
-		session = httpcloak.NewSession(f.spec.Preset, opts...)
-		ownsSession = true
-		// Reset request body for replay
-		if reqBodyBytes != nil {
-			httpReq.Body = io.NopCloser(bytes.NewReader(reqBodyBytes))
-		}
-		resp, err = f.doRoundTrip(ctx, session, httpReq, host, proxyURL)
+	// Unified request event. Every MITM request produces exactly one of
+	// these — success or failure — with the same field shape. Grep/aggregate
+	// by `mitm.request`; classify errors by `err_kind` not by error string.
+	event := MITMRequestEvent{
+		Host:       host,
+		Seed:       seed,
+		Preset:     f.spec.Preset,
+		SessionSrc: sessionSource,
+		Method:     httpReq.Method,
+		Path:       httpReq.URL.RequestURI(),
+		BodyLen:    bodyLen,
+		Elapsed:    elapsed,
+	}
+	if resp != nil {
+		event.Status = resp.StatusCode
+		event.ContentLen = resp.ContentLength
 	}
 
 	if err != nil {
-		if ownsSession {
+		event.Err = err
+		event.ErrKind = ClassifyError(err)
+		switch sessionSource {
+		case "fresh":
 			session.Close()
+		case "cached":
+			if seed != 0 && f.cache != nil {
+				f.cache.evict(seed)
+			}
+		case "tunnel-scoped":
+			// Tunnel owns session lifecycle; leave in place.
 		}
+		slog.Warn("mitm.request",
+			"host", event.Host,
+			"method", event.Method,
+			"path", event.Path,
+			"seed", event.Seed,
+			"preset", event.Preset,
+			"session", event.SessionSrc,
+			"body_len", event.BodyLen,
+			"status", event.Status,
+			"elapsed_ms", event.Elapsed.Milliseconds(),
+			"err_kind", string(event.ErrKind),
+			"err", event.Err,
+			"retryable", event.ErrKind.IsSafeToRetry())
 		return nil, err
 	}
+
+	slog.Debug("mitm.request",
+		"host", event.Host,
+		"method", event.Method,
+		"path", event.Path,
+		"seed", event.Seed,
+		"preset", event.Preset,
+		"session", event.SessionSrc,
+		"body_len", event.BodyLen,
+		"status", event.Status,
+		"content_length", event.ContentLen,
+		"elapsed_ms", event.Elapsed.Milliseconds())
+
 	if ownsSession {
 		session.Close()
 	}
 	return resp, nil
 }
 
-func (f *tlsFingerprintInterceptor) doRoundTrip(ctx context.Context, session *httpcloak.Session, httpReq *http.Request, host, proxyURL string) (*http.Response, error) {
+// redactProxyURL returns the proxy URL with password stripped — the username
+// contains sticky-session identifiers which ARE useful for correlation, so we
+// keep those.
+func redactProxyURL(u string) string {
+	i := strings.Index(u, "://")
+	if i < 0 {
+		return u
+	}
+	j := strings.Index(u[i+3:], "@")
+	if j < 0 {
+		return u
+	}
+	authPart := u[i+3 : i+3+j]
+	colon := strings.Index(authPart, ":")
+	if colon < 0 {
+		return u
+	}
+	return u[:i+3] + authPart[:colon] + ":<redacted>" + u[i+3+j:]
+}
+
+func (f *tlsFingerprintInterceptor) doRoundTrip(ctx context.Context, session *httpcloak.Session, httpReq *http.Request, reqBody io.Reader, host, proxyURL string) (*http.Response, error) {
 	urlHost := httpReq.Host
 	if urlHost == "" {
 		urlHost = host
@@ -354,20 +508,39 @@ func (f *tlsFingerprintInterceptor) doRoundTrip(ctx context.Context, session *ht
 		Method:  httpReq.Method,
 		URL:     targetURL,
 		Headers: headers,
+		Body:    reqBody,
 	}
-	if httpReq.Body != nil && httpReq.Method != http.MethodGet && httpReq.Method != http.MethodHead {
-		cloakReq.Body = httpReq.Body
-	}
+
+	slog.Debug("httpcloak session.Do begin",
+		"target", targetURL, "method", httpReq.Method,
+		"header_count", len(headers), "has_body", reqBody != nil)
+	doStart := time.Now()
 
 	resp, err := session.Do(ctx, cloakReq)
 	if err != nil {
+		slog.Debug("httpcloak session.Do failed",
+			"target", targetURL, "method", httpReq.Method,
+			"elapsed_ms", time.Since(doStart).Milliseconds(),
+			"err", err)
 		return nil, fmt.Errorf("httpcloak %s: %w", targetURL, err)
 	}
+	slog.Debug("httpcloak session.Do returned",
+		"target", targetURL, "method", httpReq.Method,
+		"status", resp.StatusCode, "protocol", resp.Protocol,
+		"elapsed_ms", time.Since(doStart).Milliseconds())
 
+	bodyStart := time.Now()
 	data, err := resp.Bytes()
 	if err != nil {
+		slog.Debug("httpcloak body read failed",
+			"target", targetURL, "status", resp.StatusCode,
+			"elapsed_ms", time.Since(bodyStart).Milliseconds(),
+			"err", err)
 		return nil, fmt.Errorf("reading httpcloak body for %s: %w", targetURL, err)
 	}
+	slog.Debug("httpcloak body read complete",
+		"target", targetURL, "bytes", len(data),
+		"elapsed_ms", time.Since(bodyStart).Milliseconds())
 
 	httpResp := &http.Response{
 		StatusCode:    resp.StatusCode,
@@ -388,18 +561,6 @@ func (f *tlsFingerprintInterceptor) doRoundTrip(ctx context.Context, session *ht
 	httpResp.Header.Del("Content-Length")
 	httpResp.Header.Del("Transfer-Encoding")
 	return httpResp, nil
-}
-
-// isStaleConnectionError detects errors from stale/closed upstream connections.
-func isStaleConnectionError(err error) bool {
-	s := err.Error()
-	return strings.Contains(s, "EOF") ||
-		strings.Contains(s, "connection reset") ||
-		strings.Contains(s, "broken pipe") ||
-		strings.Contains(s, "closed") ||
-		strings.Contains(s, "use of closed network connection") ||
-		strings.Contains(s, "CONNECT failed") ||
-		strings.Contains(s, "dial_proxy")
 }
 
 // closeHTTPCloakBody closes just the underlying HTTP response body of an

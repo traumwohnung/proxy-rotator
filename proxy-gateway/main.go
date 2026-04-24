@@ -25,7 +25,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	if cfg.LogLevel != "" {
+	// Config file's log_level applies only when no LOG_LEVEL env var was set.
+	// Env var wins so operators can flip debug on/off without editing config.
+	if os.Getenv("LOG_LEVEL") == "" && cfg.LogLevel != "" {
 		initLogging(cfg.LogLevel)
 	}
 
