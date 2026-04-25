@@ -31,8 +31,8 @@ type Config struct {
 
 // ProxySetConfig describes one named proxy set in the config file.
 type ProxySetConfig struct {
-	Name       string `toml:"name"        yaml:"name"        json:"name"`
-	SourceType string `toml:"source_type" yaml:"source_type" json:"source_type"`
+	Name       string `toml:"name"     yaml:"name"     json:"name"`
+	SourceType string `toml:"provider" yaml:"provider" json:"provider"`
 
 	// Source is parsed lazily into a typed config by buildSource.
 	StaticFile   *utils.StaticFileConfig   `toml:"static_file"  yaml:"static_file"  json:"static_file"`

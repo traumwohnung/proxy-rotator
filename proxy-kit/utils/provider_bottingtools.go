@@ -10,6 +10,8 @@ import (
 	"proxy-kit"
 )
 
+const bottingtoolsDefaultHost = "proxy.bottingtools.com"
+
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
@@ -130,10 +132,14 @@ func NewBottingtoolsSource(cfg *BottingtoolsConfig) (*BottingtoolsSource, error)
 	if err != nil {
 		return nil, fmt.Errorf("invalid product config: %w", err)
 	}
+	host := cfg.Host
+	if host == "" {
+		host = bottingtoolsDefaultHost
+	}
 	return &BottingtoolsSource{
 		accountUser: cfg.Username,
 		password:    password,
-		host:        cfg.Host,
+		host:        host,
 		product:     product,
 	}, nil
 }
