@@ -21,4 +21,4 @@ COPY --from=builder /build/proxy-gateway/proxy-gateway-server /proxy-gateway-ser
 EXPOSE 8100
 
 ENTRYPOINT ["/proxy-gateway-server"]
-CMD ["/data/config/config.toml"]
+CMD ["/data/config/config.yaml"]
